@@ -1,76 +1,156 @@
-# AdChainAudit
-Audit the ad supply chain — starting with ads.txt
-# AdChainAudit
+# 🛡️ AdChainAudit
 
-Audit the ad supply chain — starting with ads.txt.
+**Audit the ad supply chain — starting with `ads.txt`** 🔍
 
-AdChainAudit is a buyer-focused, security-style auditor for programmatic supply paths.  
-Today it lint-checks ads.txt for red flags that actually matter to media buyers. Tomorrow it maps and validates the full chain (sellers.json, schain, hop counts, reselling risk, and “cleanest path” recommendations).
-
----
-
-## Why this matters
-
-Programmatic supply chains are still too easy to game, too hard to verify, and too expensive to keep messy.
-
-- **Counterfeit / misrepresented inventory is still a thing.** ads.txt exists specifically to increase transparency and make it harder for bad actors to profit from selling counterfeit inventory by letting publishers publicly declare who is authorized to sell.  
-  (If you can’t trust the seller declaration layer, everything above it becomes guesswork.)
-
-- **Supply chain opacity is measurable.** The ISBA/PwC supply chain study found that publishers received about **half of advertiser spend**, and **15% (“unknown delta”)** could not be attributed. Even “premium” programmatic paths can hide leakage.  
-
-- **Waste/fraud is still massive.** Juniper Research estimated **22% ($84B) of online ad spend** was lost to ad fraud in 2023 (projected to grow materially over the following years).
-
-- **Even when efficiency improves, verification remains mandatory.** Benchmarks still show large portions of spend not translating cleanly into “working” outcomes, and the industry is actively pushing transparency improvements — which only works if the underlying supply signals are clean.
-
-Bottom line: **SPO is not just about cheaper CPMs. It’s about provable paths.** AdChainAudit is built to make those paths auditable.
+AdChainAudit is a **serious, hacker-style** toolkit for **Supply Path Optimization (SPO)** and supply-chain transparency.  
+Today: It audits `ads.txt` for buyer-relevant red flags (with line-level evidence).  
+Next: It evolves into a full **ad supply-chain auditor** (e.g., `sellers.json`, `schain`, hop graphs, SPO scoring, monitoring, and reports).
 
 ---
 
-## What it does today (MVP)
+## 🚨 Why this matters? (Industry reality)
 
-Given an ads.txt file (upload or paste), AdChainAudit produces:
-- A simple scorecard (risk score)
-- Buyer-facing red flags with line-level evidence
-- Exportable JSON report
+Programmatic supply chains are **complex**, **costly**, and still **hard to verify end-to-end**.
 
-### Red flag examples
-- Malformed lines (wrong number of fields)
-- Invalid relationship values (must be DIRECT or RESELLER)
-- Missing certification authority ID (transparency gap)
-- Relationship ambiguity (same seller appears as DIRECT and RESELLER)
+- **ads.txt exists to reduce counterfeit inventory and increase transparency.** It creates a public record of authorized sellers so buyers can more easily identify legitimate supply.  
+  Source: IAB Tech Lab (ads.txt) — https://iabtechlab.com/ads-txt/ and https://iabtechlab.com/ads-txt-about/
 
----
+- **Supply-chain leakage is measurable.** The ISBA/PwC study found that, on average, **~51%** of advertiser spend reached publishers (“working media”), and **~15%** was an “unknown delta” that couldn’t be attributed.  
+  Source: ISBA/PwC Executive Summary PDF — https://www.isba.org.uk/system/files/media/documents/2020-12/executive-summary-programmatic-supply-chain-transparency-study.pdf
 
-## Roadmap (where this goes)
+- **Fraud waste is massive.** Juniper Research (via PRNewswire) estimated **22% ($84B)** of online ad spend lost to ad fraud in **2023**, projected to exceed **$170B** in 5 years.  
+  Source: PRNewswire — https://www.prnewswire.com/news-releases/new-ad-fraud-study-22-of-online-ad-spend-is-wasted-due-to-ad-fraud-in-2023-according-to-juniper-research-301938050.html
 
-### Phase 1 — Ads.txt hardening (now)
-- ✅ Parse + validate ads.txt
-- ✅ Risk scoring + buyer report export
-- ⬜ Domain mode (`example.com` → fetch `/ads.txt`)
-- ⬜ Diff + monitoring (detect changes, alert on new risk)
+- **Even efficiency improvements still leave a lot on the table.** The ANA’s 2024 Programmatic Benchmark reporting highlights that for every **$1,000 entering a DSP, 43.9% reaches consumers** (as reported publicly).  
+  Sources: ANA press release — https://www.ana.net/content/show/id/pr-2024-12-programmatic  
+  and industry coverage — https://www.marketingdive.com/news/programmatic-efficient-transparent-ctv-marketing-ana/735645/
 
-### Phase 2 — Seller verification
-- ⬜ sellers.json fetch + validation (confirm seller exists, type, domain ownership)
-- ⬜ OWNERDOMAIN / MANAGERDOMAIN interpretation (where present)
-- ⬜ Evidence locker (store raw files + timestamps for audit trails)
-
-### Phase 3 — Full supply chain
-- ⬜ schain parsing + graph building (hops, intermediaries, resellers)
-- ⬜ SPO scoring (shortest/cleanest path, reseller risk, “unknown hop” penalties)
-- ⬜ Buyer controls (allowlists, preferred sellers, block risky patterns)
-- ⬜ Report packs (PDF buyer report + procurement-friendly appendix)
-
-### Phase 4 — Operator mode
-- ⬜ CLI (`adchainaudit scan <domain|file>`)
-- ⬜ GitHub Action (run audits in CI for publisher ops / adops)
-- ⬜ Dashboard + scheduled scans
+**Bottom line:** SPO isn’t just about cheaper CPMs — it’s about **provable paths**. AdChainAudit is built to make those paths auditable. ✅
 
 ---
 
-## Quickstart (local)
+## ✅ What AdChainAudit does today (MVP)
 
-### 1) Install
+Upload (or paste) an `ads.txt` file and get:
+
+- 📊 A simple **risk score**
+- 🧾 A **buyer-friendly summary** of potential red flags
+- 🧷 **Line-level evidence** (what, where, why it matters)
+- ⬇️ Exportable **JSON report**
+
+### Red flags (initial rule set)
+- ❌ Malformed lines (wrong number of fields)
+- ❌ Invalid relationship values (must be `DIRECT` or `RESELLER`)
+- ⚠️ Missing Certification Authority ID (transparency/verification gap)
+- ⚠️ Relationship ambiguity (same seller listed as `DIRECT` and `RESELLER`)
+
+> Philosophy: **evidence-first**, **buyer-relevant**, not “cosmetic lint”.
+
+---
+
+🧠 Roadmap (where this is going)
+Phase 1 — Ads.txt hardening (now)
+
+✅ Ads.txt parsing + validation
+
+✅ Risk scoring + red-flag report
+
+⬜ Domain mode: example.com → fetch https://example.com/ads.txt
+
+⬜ Change detection: diff + alerts (new sellers, new resellers, new risk)
+
+Phase 2 — Seller verification (sellers.json)
+
+⬜ Fetch/validate sellers.json per ad system (SSP/exchange)
+
+⬜ Verify seller IDs + seller type + declared domains (when available)
+
+⬜ Evidence locker (store fetched artifacts + timestamps)
+
+Phase 3 — Full supply-chain graph
+
+⬜ Parse and map schain (SupplyChain object) into a hop graph
+
+⬜ SPO scoring: hops, reseller concentration, unknown hops, path cleanliness
+
+⬜ Buyer controls: allowlists / blocklists / preferred paths
+
+Phase 4 — Operator mode (serious tooling)
+
+⬜ CLI: adchainaudit scan <domain|file>
+
+⬜ GitHub Action / CI checks for publisher ops & adops workflows
+
+⬜ Dashboards + scheduled scans + PDF buyer packs
+
+## 🤝 Contributing (yes please!)
+
+I’m **very open** to collaborators — engineers, adops folks, SPO nerds, agency buyers, SSP/DSP people.  
+If this problem space excites you, jump in. 🚀
+
+### 🛠️ Ways to contribute
+- 🧪 **Add a new rule** (with test cases + examples)
+- 🧱 **Improve scoring + severity logic**
+- 🌐 **Implement `sellers.json` checks**
+- 🕸️ **Build the supply-chain graph layer** (`schain`)
+- 🧰 **Add CLI + GitHub Actions**
+- 🧾 **Improve reporting** (JSON schema, PDF export, evidence trails)
+
+### 🏁 Getting started
+1. 🍴 **Fork the repo**
+2. 🌿 **Create a feature branch** (`feature/your-thing`)
+3. 🧫 **Add tests + sample fixtures** (if possible)
+4. 📬 **Open a PR** with a clear description + screenshots (if UI)
+
+### ✅ Rule PR checklist (simple)
+- ⚠️ **What is the risk?**
+- 🎯 **Why does a buyer care?**
+- 🧠 **How does the tool detect it?**
+- 🧾 **Example input → expected output**
+
+💬 Community & Collaboration
+
+Use Issues for bugs, feature requests, and rule proposals
+
+Use Discussions for SPO ideas, scoring debates, and roadmap planning
+
+Be kind. Be sharp. No ego. 🫶
+
+If you want to collaborate closely, open an issue titled:
+“Collab: <what you want to build>” — I’ll respond and we’ll align.
+
+🔒 Security / Responsible Disclosure
+
+If you discover a vulnerability (especially around file uploads or fetching remote URLs), please open a private disclosure path if available, or file a minimal issue without exploit details.
+
+📄 License
+
+Recommended: MIT (simple, friendly for open-source tooling).
+Add a LICENSE file when you’re ready.
+
+📚 References
+
+IAB Tech Lab — ads.txt
+https://iabtechlab.com/ads-txt/
+
+https://iabtechlab.com/ads-txt-about/
+
+ISBA/PwC — Programmatic Supply Chain Transparency Study (Exec Summary PDF)
+https://www.isba.org.uk/system/files/media/documents/2020-12/executive-summary-programmatic-supply-chain-transparency-study.pdf
+
+Juniper Research (via PRNewswire) — 2023 ad fraud estimate
+https://www.prnewswire.com/news-releases/new-ad-fraud-study-22-of-online-ad-spend-is-wasted-due-to-ad-fraud-in-2023-according-to-juniper-research-301938050.html
+
+ANA — 2024 Programmatic Benchmark Study (press release + reporting)
+https://www.ana.net/content/show/id/pr-2024-12-programmatic
+
+https://www.marketingdive.com/news/programmatic-efficient-transparent-ctv-marketing-ana/735645/
+
+## 🏁 Quickstart (local)
+
+### 1) Setup
 ```bash
 python -m venv .venv
-source .venv/bin/activate  # (Windows: .venv\Scripts\activate)
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
+
