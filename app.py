@@ -68,14 +68,14 @@ THEME_INFO = {
         ],
     },
     "Selling relationship clarity": {
-        "why": "If the same seller appears as both DIRECT and RESELLER, it can be unclear which route is preferred — and whether intermediaries are being added unnecessarily.",
+        "why": "If the same seller appears as both DIRECT and RESELLER, it can be unclear which route is preferred and whether intermediaries are being added unnecessarily.",
         "questions": [
             "Which route is preferred for our buys for this publisher?",
             "Can we prioritize DIRECT where available and justify reseller paths?",
         ],
     },
     "Verification signals (optional)": {
-        "why": "Verification fields (like CAID) can help at scale, but many publishers omit them. This is usually an ‘extra signal’, not a hard red flag.",
+        "why": "Verification fields (like CAID) can help at scale, but many publishers omit them. This is usually an extra signal, not a hard red flag.",
         "questions": [
             "Optional: can the publisher/seller include CAID where applicable?",
         ],
@@ -104,12 +104,11 @@ def group_findings_by_theme(findings: List[dict]) -> Dict[str, List[dict]]:
         rid = f.get("rule_id", "OTHER")
         theme = theme_for_rule(rid)
         buckets.setdefault(theme, []).append(f)
-    # Keep a consistent, friendly order
-    ordered = {}
+
+    ordered: Dict[str, List[dict]] = {}
     for k in ["Format & spec compliance", "Selling relationship clarity", "Verification signals (optional)", "Other"]:
         if k in buckets:
             ordered[k] = buckets[k]
-    # any remaining themes
     for k, v in buckets.items():
         if k not in ordered:
             ordered[k] = v
@@ -125,29 +124,6 @@ def top_rule_counts_in_theme(findings: List[dict], n: int = 3) -> List[Tuple[str
     return items[:n]
 
 
-def compact_pill_notice() -> None:
-    pill_html = f"""
-    <div style="
-        display:flex; gap:10px; align-items:flex-start;
-        background:#EAF4FF; border:1px solid #CFE6FF;
-        padding:10px 12px; border-radius:12px;
-        line-height:1.25; font-size:14px; color:#0B2540;
-    ">
-      <div style="font-size:18px; margin-top:1px;">ℹ️</div>
-      <div>
-        <div><b>Open-source (MIT)</b> ✅</div>
-        <div style="margin-top:2px;">
-          Marketers can use the app. Technical folks can contribute via
-          <a href="{GITHUB_REPO_URL}" target="_blank" style="color:#0B5FFF; text-decoration:none;">
-            GitHub
-          </a>.
-        </div>
-      </div>
-    </div>
-    """
-    st.markdown(pill_html, unsafe_allow_html=True)
-
-
 def main() -> None:
     st.set_page_config(page_title=APP_TITLE, page_icon="🛡️", layout="wide")
 
@@ -157,8 +133,8 @@ def main() -> None:
         "Upload or paste an ads.txt file to generate a buyer-focused red-flag summary."
     )
 
-    # Top row
-    c1, c2, c3 = st.columns([1.15, 1.25, 3.6])
+    # Top row (removed open-source banner)
+    c1, c2 = st.columns([1.15, 1.25])
 
     with c1:
         if st.button("⚡ Try sample ads.txt", use_container_width=True):
@@ -167,9 +143,6 @@ def main() -> None:
 
     with c2:
         st.link_button("👩‍💻 GitHub (technical)", GITHUB_REPO_URL, use_container_width=True)
-
-    with c3:
-        compact_pill_notice()
 
     with st.expander("📌 How to get a site’s ads.txt (quick)", expanded=False):
         st.markdown(
@@ -199,7 +172,6 @@ This is a **sanity-check score** to prioritize questions. It doesn’t prove fra
 
     include_optional = st.checkbox("Include optional signals (e.g., missing CAID)", value=False)
 
-    # Input
     tab_upload, tab_paste = st.tabs(["📤 Upload ads.txt", "📋 Paste ads.txt"])
 
     with tab_upload:
@@ -217,8 +189,9 @@ This is a **sanity-check score** to prioritize questions. It doesn’t prove fra
         )
         set_ads_text(ads_text, get_source_label())
 
+    # ✅ Make sample usage VERY visible
     if get_source_label() == SAMPLE_LABEL:
-        st.caption(SAMPLE_SOURCE_NOTE)
+        st.error(f"🚨 SAMPLE LOADED: {SAMPLE_SOURCE_NOTE}", icon="⚠️")
 
     st.divider()
 
@@ -247,13 +220,9 @@ This is a **sanity-check score** to prioritize questions. It doesn’t prove fra
         if not findings:
             st.success("No red flags detected by the current rule set.")
         else:
-            # -------------------------------
-            # Theme-based summary (NEW)
-            # -------------------------------
             st.subheader("Themes summary (what to focus on)")
             buckets = group_findings_by_theme(findings)
 
-            # Optional: a small at-a-glance row
             theme_cols = st.columns(min(4, max(1, len(buckets))))
             for i, (theme, fs) in enumerate(list(buckets.items())[:4]):
                 sev = max_severity(fs)
@@ -262,7 +231,6 @@ This is a **sanity-check score** to prioritize questions. It doesn’t prove fra
 
             st.caption("Tip: Start with the highest-severity theme and the most repeated issue inside it.")
 
-            # One expander per theme (clean + not repetitive)
             for theme, fs in buckets.items():
                 sev = max_severity(fs)
                 badge = SEV_BADGE.get(sev, "🟦")
@@ -282,7 +250,6 @@ This is a **sanity-check score** to prioritize questions. It doesn’t prove fra
                         for q in questions:
                             st.markdown(f"- {q}")
 
-                    # Show a few evidence examples only (avoid walls of text)
                     st.markdown("**Example evidence (first 5):**")
                     shown = 0
                     for f in fs:
@@ -299,11 +266,8 @@ This is a **sanity-check score** to prioritize questions. It doesn’t prove fra
                     if len(fs) > 5:
                         st.caption(f"Showing 5 examples out of {len(fs)}. Use CSV export for the full list.")
 
-            # -------------------------------
-            # Optional: keep raw list hidden
-            # -------------------------------
             with st.expander("📋 See raw finding list (advanced)", expanded=False):
-                st.caption("This is the ungrouped list. It can be repetitive for large files.")
+                st.caption("Ungrouped list. Can be repetitive for large files.")
                 for f in findings[:50]:
                     sev = f.get("severity", "LOW")
                     title = f.get("title", "Finding")
@@ -323,7 +287,6 @@ This is a **sanity-check score** to prioritize questions. It doesn’t prove fra
                 if len(findings) > 50:
                     st.caption(f"Showing first 50 findings out of {len(findings)}.")
 
-        # Exports
         st.subheader("Exports")
         dl = st.columns([1, 1, 1, 1])
         dl[0].download_button(
