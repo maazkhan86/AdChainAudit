@@ -9,8 +9,9 @@ import streamlit as st
 from analyzer import parse_ads_txt, analyze, to_report_json
 
 
+# ----------------- helpers: exports -----------------
+
 def build_text_report(summary: dict, issues: list[dict], max_examples: int = 5) -> str:
-    """Human-readable report for non-technical users."""
     lines: list[str] = []
     lines.append("AdChainAudit Report")
     lines.append("=" * 60)
@@ -56,11 +57,10 @@ def build_text_report(summary: dict, issues: list[dict], max_examples: int = 5) 
 
 
 def build_csv_issues(issues: list[dict], max_examples: int = 3) -> str:
-    """CSV of issues (one row per issue) for Excel / buyers / procurement."""
     output = io.StringIO()
     writer = csv.writer(output)
-
     writer.writerow(["severity", "title", "detail", "example_lines"])
+
     for issue in issues:
         sev = issue.get("severity", "")
         title = issue.get("title", "")
@@ -75,10 +75,6 @@ def build_csv_issues(issues: list[dict], max_examples: int = 3) -> str:
 
 
 def build_pdf_report(summary: dict, issues: list[dict], max_examples: int = 4) -> bytes | None:
-    """
-    Generates a simple PDF in-memory.
-    Returns PDF bytes if reportlab is available, else None.
-    """
     try:
         from reportlab.lib.pagesizes import A4
         from reportlab.lib.units import mm
@@ -95,7 +91,6 @@ def build_pdf_report(summary: dict, issues: list[dict], max_examples: int = 4) -
     line_h = 5.2 * mm
 
     def draw_line(text: str, x: float, y: float) -> float:
-        # naive wrap: split long lines into chunks
         max_chars = 110
         chunks = [text[i : i + max_chars] for i in range(0, len(text), max_chars)] or [""]
         for chunk in chunks:
@@ -106,7 +101,6 @@ def build_pdf_report(summary: dict, issues: list[dict], max_examples: int = 4) -
                 y = top
         return y
 
-    # Title
     y = top
     c.setFont("Helvetica-Bold", 14)
     y = draw_line("AdChainAudit Report", left, y)
@@ -114,7 +108,6 @@ def build_pdf_report(summary: dict, issues: list[dict], max_examples: int = 4) -
     y = draw_line(f"Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC", left, y)
     y -= line_h
 
-    # Summary
     c.setFont("Helvetica-Bold", 11)
     y = draw_line("Summary", left, y)
     c.setFont("Helvetica", 9)
@@ -133,8 +126,6 @@ def build_pdf_report(summary: dict, issues: list[dict], max_examples: int = 4) -
         y = draw_line(f"- {s}", left, y)
 
     y -= line_h
-
-    # Issues
     c.setFont("Helvetica-Bold", 11)
     y = draw_line("Potential red flags", left, y)
     c.setFont("Helvetica", 9)
@@ -168,15 +159,34 @@ def build_pdf_report(summary: dict, issues: list[dict], max_examples: int = 4) -
 st.set_page_config(page_title="AdChainAudit", layout="wide")
 
 st.title("🛡️ AdChainAudit")
-st.caption("Audit the ad supply chain — starting with ads.txt. Upload a file or paste contents to generate a buyer-focused red-flag summary.")
+st.caption(
+    "Audit the ad supply chain starting with ads.txt. Upload a file or paste contents to generate a buyer focused red flag summary."
+)
 
 with st.sidebar:
     st.header("⚙️ Options")
-    show_meta = st.toggle("Show meta/variable lines (if present)", value=False)
+    show_meta = st.toggle("Show meta or variable lines (if present)", value=False)
     max_examples = st.slider("Examples per issue (UI)", 5, 25, 12, step=1)
     export_examples = st.slider("Examples per issue (exports)", 1, 10, 4, step=1)
 
 tab_upload, tab_paste = st.tabs(["📤 Upload ads.txt", "📋 Paste ads.txt"])
+
+# ✅ Cleaner help: collapsed, minimal space
+with st.expander("Need help finding a website ads.txt?", expanded=False):
+    st.markdown(
+        """
+**Quick way:**
+- Open: `https://example.com/ads.txt` (replace `example.com` with the website)
+
+**Then:**
+- Copy and paste into the *Paste ads.txt* tab, or
+- Save as a text file named `ads.txt` and upload it
+
+**Tips:**
+- Try both `example.com/ads.txt` and `www.example.com/ads.txt`
+- If a site does not publish ads.txt, that itself is a useful signal
+"""
+    )
 
 content = None
 
@@ -197,21 +207,21 @@ if not content:
 records = parse_ads_txt(content)
 summary, issues = analyze(records)
 
-# --- KPI row ---
+# KPI row
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Entries parsed", summary["totals"]["entries"])
 c2.metric("DIRECT", summary["relationships"].get("DIRECT", 0))
 c3.metric("RESELLER", summary["relationships"].get("RESELLER", 0))
-c4.metric("Risk score (0–100)", summary["risk_score_0_100"])
+c4.metric("Risk score (0 to 100)", summary["risk_score_0_100"])
 
-# --- Summary ---
+# Summary
 st.subheader("🧾 Summary")
 st.write(
     f"- **Relationship ambiguity pairs:** {summary['relationship_ambiguity_pairs']}\n"
     f"- **Entries missing CAID (field #4):** {summary['missing_caid_entries']}\n"
 )
 
-# --- Issues ---
+# Issues
 st.subheader("🚩 Potential red flags")
 if not issues:
     st.success("No red flags detected with the current rule set.")
@@ -226,37 +236,25 @@ else:
         examples = issue.get("examples", [])[:max_examples]
 
         expanded = sev in ("CRITICAL", "HIGH")
-        with st.expander(f"{sev} — {title}", expanded=expanded):
+        with st.expander(f"{sev} - {title}", expanded=expanded):
             st.write(detail)
             if examples:
-                st.markdown("**Examples (line-level evidence):**")
-                lines = []
-                for e in examples:
-                    line_no = e.get("line_no")
-                    raw = (e.get("raw", "") or "").rstrip("\n")
-                    lines.append(f"L{line_no}: {raw}")
-                st.code("\n".join(lines))
+                st.markdown("**Examples (line level evidence):**")
+                st.code("\n".join([f"L{e.get('line_no')}: {(e.get('raw','') or '').rstrip()}" for e in examples]))
 
-# --- Optional meta lines ---
+# Optional meta lines
 if show_meta and summary["totals"]["meta_lines"] > 0:
-    st.subheader("🧩 Meta / variable lines")
+    st.subheader("🧩 Meta or variable lines")
     meta = [r for r in records if r.record_type == "meta"]
     for m in meta[:200]:
         st.write(f"- `L{m.line_no}` **{m.meta_key}** = `{m.meta_value}`")
 
-# --- Exports ---
+# Exports
 st.subheader("⬇️ Export")
 
-# JSON (existing)
 report_json = to_report_json(summary, issues)
-
-# TXT (buyer-friendly)
 report_txt = build_text_report(summary, issues, max_examples=export_examples)
-
-# CSV (Excel-friendly)
 report_csv = build_csv_issues(issues, max_examples=export_examples)
-
-# PDF (optional if reportlab installed)
 pdf_bytes = build_pdf_report(summary, issues, max_examples=export_examples)
 
 colA, colB, colC, colD = st.columns(4)
@@ -287,7 +285,7 @@ with colC:
 
 with colD:
     if pdf_bytes is None:
-        st.caption("📄 PDF requires `reportlab` in requirements.txt")
+        st.caption("📄 PDF requires reportlab in requirements.txt")
     else:
         st.download_button(
             label="📄 Download PDF",
@@ -296,7 +294,21 @@ with colD:
             mime="application/pdf",
         )
 
-with st.expander("Preview: TXT report"):
+with st.expander("Preview: TXT report", expanded=False):
     st.code(report_txt)
 
-st.caption("🧠 Tip: Exports are useful evidence snapshots as ads.txt changes over time.")
+# ✅ Open-source + contribution block (clean, not too big)
+st.markdown("---")
+with st.expander("Open source, MIT license, and contributions", expanded=False):
+    st.markdown(
+        """
+AdChainAudit is **open source** under the **MIT License**.
+
+- 🌟 GitHub repo (for technical users who want to contribute or extend it):  
+  https://github.com/maazkhan86/AdChainAudit
+
+- 🤝 Want to help? New rules, better scoring, sellers.json checks, and supply chain mapping are welcome.
+"""
+    )
+
+st.caption("Tip: Exports are useful evidence snapshots because ads.txt can change over time.")
