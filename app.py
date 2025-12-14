@@ -1,4 +1,4 @@
-# app.py (only the top layout section changed)
+# app.py
 from __future__ import annotations
 
 from pathlib import Path
@@ -10,6 +10,7 @@ from analyzer import analyze_ads_txt, report_to_csv_bytes, report_to_json_bytes,
 
 APP_TITLE = "AdChainAudit"
 
+# --- Sample snapshot ---
 SAMPLE_PATH = Path("samples/thestar_ads_20251214.txt")
 SAMPLE_LABEL = "thestar.com.my/ads.txt (snapshot: 14 Dec 2025)"
 SAMPLE_SOURCE_NOTE = (
@@ -17,6 +18,7 @@ SAMPLE_SOURCE_NOTE = (
     "ads.txt changes over time; treat this as a demo input."
 )
 
+# --- Links ---
 GITHUB_REPO_URL = "https://github.com/maazkhan86/AdChainAudit"
 
 
@@ -27,6 +29,7 @@ def load_sample_text() -> str:
     return (
         "# Sample file missing.\n"
         "# Please add: samples/thestar_ads_20251214.txt\n"
+        "# Paste your thestar.com.my/ads.txt snapshot (14 Dec 2025) into that file.\n"
     )
 
 
@@ -45,16 +48,22 @@ def get_source_label() -> str:
 
 
 def main() -> None:
-    st.set_page_config(page_title=APP_TITLE, page_icon="🛡️", layout="wide")
+    st.set_page_config(
+        page_title=APP_TITLE,
+        page_icon="🛡️",
+        layout="wide",
+        initial_sidebar_state="collapsed",
+    )
 
+    # Header
     st.markdown(f"# 🛡️ {APP_TITLE}")
     st.caption(
         "Audit the ad supply chain starting with ads.txt. "
         "Upload or paste an ads.txt file to generate a buyer-focused red-flag summary."
     )
 
-    # ✅ Cleaner top row: remove "Open web app", fix MIT note formatting
-    c1, c2, c3 = st.columns([1.2, 1.2, 3.6])
+    # Compact action row
+    c1, c2, c3 = st.columns([1.25, 1.25, 3.5])
 
     with c1:
         if st.button("⚡ Try sample ads.txt", use_container_width=True):
@@ -64,24 +73,46 @@ def main() -> None:
     with c2:
         st.link_button("👩‍💻 GitHub (technical)", GITHUB_REPO_URL, use_container_width=True)
 
+    # Tight pill-style banner (less height)
     with c3:
-        st.info(
-            "✅ Open-source (MIT).\n"
-            "Marketers can use the app.\n"
-            "Technical folks can contribute via GitHub.",
-            icon="ℹ️",
-        )
+        pill_html = f"""
+        <div style="
+            display:flex;
+            gap:10px;
+            align-items:flex-start;
+            background:#EAF4FF;
+            border:1px solid #CFE6FF;
+            padding:10px 12px;
+            border-radius:12px;
+            line-height:1.25;
+            font-size:14px;
+            color:#0B2540;
+        ">
+          <div style="font-size:18px; margin-top:1px;">ℹ️</div>
+          <div>
+            <div><b>Open-source (MIT)</b> ✅</div>
+            <div style="margin-top:2px;">
+              Marketers can use the app. Technical folks can contribute via
+              <a href="{GITHUB_REPO_URL}" target="_blank" style="color:#0B5FFF; text-decoration:none;">
+                GitHub
+              </a>.
+            </div>
+          </div>
+        </div>
+        """
+        st.markdown(pill_html, unsafe_allow_html=True)
 
-    # Keep this compact
+    # Compact how-to
     with st.expander("📌 How to get a site’s ads.txt (quick)", expanded=False):
         st.markdown(
             """
-1. Open: `https://example.com/ads.txt`
-2. If it 404s, try: `https://www.example.com/ads.txt`
+1. Open: `https://example.com/ads.txt`  
+2. If it 404s, try: `https://www.example.com/ads.txt`  
 3. Copy all text and paste it here, or save as `ads.txt` and upload.
 """
         )
 
+    # Input tabs
     tab_upload, tab_paste = st.tabs(["📤 Upload ads.txt", "📋 Paste ads.txt"])
 
     with tab_upload:
@@ -103,8 +134,8 @@ def main() -> None:
         st.caption(SAMPLE_SOURCE_NOTE)
 
     st.divider()
-    run = st.button("🔎 Run audit", type="primary")
 
+    run = st.button("🔎 Run audit", type="primary")
     if run:
         text = get_ads_text().strip()
         if not text:
@@ -114,12 +145,14 @@ def main() -> None:
         with st.spinner("Analyzing…"):
             report = analyze_ads_txt(text=text, source_label=get_source_label())
 
+        # Summary row
         top = st.columns([1.1, 1.1, 1.1, 1.7])
         top[0].metric("Risk score", report["summary"]["risk_score"])
         top[1].metric("Risk level", report["summary"]["risk_level"])
         top[2].metric("Findings", report["summary"]["finding_count"])
         top[3].metric("Entries", report["summary"]["entry_count"])
 
+        # Findings
         st.subheader("Buyer-relevant red flags")
         findings = report.get("findings", [])
         if not findings:
@@ -134,6 +167,7 @@ def main() -> None:
                 line = evidence.get("line", "")
 
                 badge = {"CRITICAL": "🟥", "HIGH": "🟧", "MEDIUM": "🟨", "LOW": "🟦"}.get(sev, "🟦")
+
                 with st.expander(f"{badge} [{sev}] {title}", expanded=False):
                     if why:
                         st.write(why)
@@ -143,11 +177,40 @@ def main() -> None:
                     if rec:
                         st.markdown(f"**What to do:** {rec}")
 
+            if len(findings) > 50:
+                st.caption(f"Showing first 50 findings out of {len(findings)}.")
+
+        # Exports
         st.subheader("Exports")
-        dl = st.columns([1, 1, 1])
-        dl[0].download_button("⬇️ JSON", report_to_json_bytes(report), "adchainaudit_report.json", "application/json", use_container_width=True)
-        dl[1].download_button("⬇️ TXT", report_to_txt_bytes(report), "adchainaudit_report.txt", "text/plain", use_container_width=True)
-        dl[2].download_button("⬇️ CSV", report_to_csv_bytes(report), "adchainaudit_findings.csv", "text/csv", use_container_width=True)
+        dl = st.columns([1, 1, 1, 1])
+        dl[0].download_button(
+            "⬇️ JSON",
+            data=report_to_json_bytes(report),
+            file_name="adchainaudit_report.json",
+            mime="application/json",
+            use_container_width=True,
+        )
+        dl[1].download_button(
+            "⬇️ TXT",
+            data=report_to_txt_bytes(report),
+            file_name="adchainaudit_report.txt",
+            mime="text/plain",
+            use_container_width=True,
+        )
+        dl[2].download_button(
+            "⬇️ CSV",
+            data=report_to_csv_bytes(report),
+            file_name="adchainaudit_findings.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+        dl[3].download_button(
+            "⬇️ Sample ads.txt",
+            data=load_sample_text().encode("utf-8", errors="replace"),
+            file_name="sample_thestar_ads_20251214.txt",
+            mime="text/plain",
+            use_container_width=True,
+        )
 
     st.caption("Built in public. Feedback, feature ideas, and collaborators welcome 🤝")
 
