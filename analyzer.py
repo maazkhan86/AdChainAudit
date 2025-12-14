@@ -1,230 +1,225 @@
+# analyzer.py
 from __future__ import annotations
 
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+from io import StringIO
+from typing import Dict, List, Optional, Tuple
+import csv
 import json
-import re
-from collections import Counter, defaultdict
-from dataclasses import dataclass, asdict
-from typing import Any, Dict, List, Optional, Tuple
 
 
-# Simple FQDN-ish check (not perfect, but useful)
-DOMAIN_RE = re.compile(r"^(?=.{1,253}$)([a-z0-9-]+\.)+[a-z]{2,63}$", re.IGNORECASE)
-
-VALID_RELATIONSHIPS = {"DIRECT", "RESELLER"}
+ALLOWED_RELATIONSHIPS = {"DIRECT", "RESELLER"}
 
 
 @dataclass
-class AdsTxtRecord:
-    line_no: int
-    raw: str
-    domain: str = ""
-    account_id: str = ""
-    relationship: str = ""
-    caid: str = ""  # Certification Authority ID (optional)
-    field_count: int = 0
-    record_type: str = "entry"  # "entry" or "meta"
-    meta_key: str = ""
-    meta_value: str = ""
+class Evidence:
+    line_no: Optional[int] = None
+    line: str = ""
 
 
-def _strip_inline_comment(line: str) -> str:
-    # Remove inline comment fragments after '#'
-    if "#" in line:
-        line = line.split("#", 1)[0]
+@dataclass
+class Finding:
+    rule_id: str
+    severity: str  # CRITICAL/HIGH/MEDIUM/LOW
+    title: str
+    why_buyer_cares: str
+    recommendation: str
+    evidence: Evidence
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _clean_line(line: str) -> str:
     return line.strip()
 
 
-def parse_ads_txt(text: str) -> List[AdsTxtRecord]:
-    """
-    Parses ads.txt content into records.
+def _is_comment_or_blank(line: str) -> bool:
+    s = line.strip()
+    return (not s) or s.startswith("#")
 
-    Supports:
-    - Standard ads.txt entries: <ad_system_domain>, <publisher_id>, <DIRECT|RESELLER>, [cert_authority_id]
-    - Simple meta/variable lines like: OWNERDOMAIN=example.com (kept as record_type="meta")
-    """
-    records: List[AdsTxtRecord] = []
 
-    for i, raw in enumerate(text.splitlines(), start=1):
-        stripped = _strip_inline_comment(raw)
-        if not stripped:
+def _split_fields(line: str) -> List[str]:
+    # ads.txt uses comma-separated fields. We keep it simple and tolerant.
+    return [p.strip() for p in line.split(",")]
+
+
+def _risk_level(score: int) -> str:
+    if score >= 80:
+        return "LOW"
+    if score >= 55:
+        return "MEDIUM"
+    return "HIGH"
+
+
+def _severity_weight(sev: str) -> int:
+    return {"CRITICAL": 15, "HIGH": 10, "MEDIUM": 6, "LOW": 3}.get(sev, 3)
+
+
+def analyze_ads_txt(text: str, source_label: str = "ads.txt") -> Dict:
+    lines = text.splitlines()
+
+    entry_rows: List[Tuple[int, str, List[str]]] = []
+    for idx, raw in enumerate(lines, start=1):
+        line = _clean_line(raw)
+        if _is_comment_or_blank(line):
             continue
+        fields = _split_fields(line)
+        entry_rows.append((idx, line, fields))
 
-        # Handle meta lines (e.g., OWNERDOMAIN=..., contact=..., etc.)
-        if "=" in stripped and "," not in stripped:
-            key, val = stripped.split("=", 1)
-            rec = AdsTxtRecord(
-                line_no=i,
-                raw=raw,
-                record_type="meta",
-                meta_key=key.strip(),
-                meta_value=val.strip(),
+    findings: List[Finding] = []
+
+    # Rule: malformed lines (wrong number of fields)
+    for line_no, line, fields in entry_rows:
+        if len(fields) not in (3, 4):
+            findings.append(
+                Finding(
+                    rule_id="MALFORMED_LINE",
+                    severity="HIGH",
+                    title="Malformed ads.txt line (unexpected number of fields)",
+                    why_buyer_cares="Malformed lines can break automated checks and create ambiguity around who is actually authorized to sell inventory.",
+                    recommendation="Ask the publisher to fix formatting. Buyers should prefer clean, machine-parseable ads.txt.",
+                    evidence=Evidence(line_no=line_no, line=line),
+                )
             )
-            records.append(rec)
-            continue
 
-        # Standard entry lines
-        parts = [p.strip() for p in stripped.split(",")]
+    # Rule: invalid relationship values
+    for line_no, line, fields in entry_rows:
+        if len(fields) >= 3:
+            rel = fields[2].upper()
+            if rel not in ALLOWED_RELATIONSHIPS:
+                findings.append(
+                    Finding(
+                        rule_id="INVALID_RELATIONSHIP",
+                        severity="HIGH",
+                        title="Invalid relationship value (must be DIRECT or RESELLER)",
+                        why_buyer_cares="If relationship is not clearly declared, it becomes harder to validate the path and enforce preferred routes.",
+                        recommendation="Ask the publisher to correct relationship values to DIRECT or RESELLER only.",
+                        evidence=Evidence(line_no=line_no, line=line),
+                    )
+                )
 
-        # Remove empty trailing fields if someone ended with comma(s)
-        while parts and parts[-1] == "":
-            parts.pop()
+    # Rule: missing certification authority ID (CAID) (4th field)
+    for line_no, line, fields in entry_rows:
+        if len(fields) == 3:
+            findings.append(
+                Finding(
+                    rule_id="MISSING_CAID",
+                    severity="MEDIUM",
+                    title="Missing Certification Authority ID (CAID) field",
+                    why_buyer_cares="CAID can help buyers validate and match seller identities across systems. Missing IDs reduce verifiability.",
+                    recommendation="Ask the publisher or seller to include the CAID where applicable (4th field).",
+                    evidence=Evidence(line_no=line_no, line=line),
+                )
+            )
 
-        domain = parts[0] if len(parts) > 0 else ""
-        account_id = parts[1] if len(parts) > 1 else ""
-        relationship = parts[2].upper() if len(parts) > 2 else ""
-        caid = parts[3] if len(parts) > 3 else ""
+    # Rule: relationship ambiguity (same seller listed as both DIRECT and RESELLER)
+    seen: Dict[Tuple[str, str], set] = {}
+    for line_no, line, fields in entry_rows:
+        if len(fields) >= 3:
+            ad_system = fields[0].lower()
+            seller_id = fields[1]
+            rel = fields[2].upper()
+            key = (ad_system, seller_id)
+            seen.setdefault(key, set()).add(rel)
 
-        rec = AdsTxtRecord(
-            line_no=i,
-            raw=raw,
-            domain=domain,
-            account_id=account_id,
-            relationship=relationship,
-            caid=caid,
-            field_count=len(parts),
-            record_type="entry",
-        )
-        records.append(rec)
-
-    return records
-
-
-def _issue(severity: str, title: str, detail: str, examples: List[AdsTxtRecord]) -> Dict[str, Any]:
-    return {
-        "severity": severity,
-        "title": title,
-        "detail": detail,
-        "examples": [asdict(e) for e in examples],
-    }
-
-
-def analyze(records: List[AdsTxtRecord]) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
-    """
-    Returns:
-      summary: dict
-      issues: list[dict] (each includes severity/title/detail/examples)
-    """
-    issues: List[Dict[str, Any]] = []
-
-    entry_records = [r for r in records if r.record_type == "entry"]
-    meta_records = [r for r in records if r.record_type == "meta"]
-
-    total_entries = len(entry_records)
-    total_meta = len(meta_records)
-
-    # --- Critical structure checks ---
-    malformed = [r for r in entry_records if r.field_count not in (3, 4)]
-    if malformed:
-        issues.append(_issue(
-            "CRITICAL",
-            "Malformed lines (wrong number of fields)",
-            "Each ads.txt entry should have 3 or 4 comma-separated fields (domain, account, relationship, optional CAID).",
-            malformed[:12],
-        ))
-
-    invalid_relationship = [r for r in entry_records if r.relationship not in VALID_RELATIONSHIPS]
-    if invalid_relationship:
-        issues.append(_issue(
-            "CRITICAL",
-            "Invalid relationship value",
-            "Relationship (field #3) should be DIRECT or RESELLER.",
-            invalid_relationship[:12],
-        ))
-
-    missing_domain = [r for r in entry_records if not (r.domain or "").strip()]
-    if missing_domain:
-        issues.append(_issue(
-            "CRITICAL",
-            "Missing ad system domain",
-            "The ad system domain (field #1) is required for a valid entry.",
-            missing_domain[:12],
-        ))
-
-    missing_account = [r for r in entry_records if not (r.account_id or "").strip()]
-    if missing_account:
-        issues.append(_issue(
-            "CRITICAL",
-            "Missing publisher account ID",
-            "The publisher account ID (field #2) is required for a valid entry.",
-            missing_account[:12],
-        ))
-
-    # --- Buyer-relevant risk signals ---
-    suspicious_domains = [r for r in entry_records if r.domain and not DOMAIN_RE.match(r.domain)]
-    if suspicious_domains:
-        issues.append(_issue(
-            "HIGH",
-            "Suspicious ad system domains",
-            "Some domains don't look like standard fully-qualified domains. This can indicate typos or configuration mistakes.",
-            suspicious_domains[:12],
-        ))
-
-    missing_caid = [r for r in entry_records if r.field_count == 3]
-    if missing_caid and total_entries > 0:
-        issues.append(_issue(
-            "MEDIUM",
-            "Missing Certification Authority ID on some entries",
-            "CAID (field #4) is optional, but its absence can reduce certain verification/traceability coverage depending on partners.",
-            missing_caid[:12],
-        ))
-
-    # Relationship ambiguity: same (domain, account_id) appears as both DIRECT and RESELLER
-    rels: Dict[Tuple[str, str], set] = defaultdict(set)
-    rel_examples: Dict[Tuple[str, str], List[AdsTxtRecord]] = defaultdict(list)
-
-    for r in entry_records:
-        key = (r.domain.lower(), r.account_id.strip())
-        if not key[0] or not key[1]:
-            continue
-        if r.relationship:
-            rels[key].add(r.relationship)
-        if len(rel_examples[key]) < 6:
-            rel_examples[key].append(r)
-
-    ambiguous_keys = [k for k, v in rels.items() if ("DIRECT" in v and "RESELLER" in v)]
+    ambiguous_keys = {k for k, rels in seen.items() if ("DIRECT" in rels and "RESELLER" in rels)}
     if ambiguous_keys:
-        ex: List[AdsTxtRecord] = []
-        for k in ambiguous_keys[:6]:
-            ex.extend(rel_examples[k][:4])
-        issues.append(_issue(
-            "HIGH",
-            "Relationship ambiguity (DIRECT and RESELLER for same seller)",
-            "The same seller (domain + account) is declared with both DIRECT and RESELLER. This can create uncertainty for buyers.",
-            ex[:12],
-        ))
+        for line_no, line, fields in entry_rows:
+            if len(fields) >= 3:
+                key = (fields[0].lower(), fields[1])
+                if key in ambiguous_keys:
+                    findings.append(
+                        Finding(
+                            rule_id="RELATIONSHIP_AMBIGUITY",
+                            severity="MEDIUM",
+                            title="Relationship ambiguity (seller appears as DIRECT and RESELLER)",
+                            why_buyer_cares="Ambiguity makes it harder to enforce preferred paths and can hide extra intermediaries or unclear selling relationships.",
+                            recommendation="Ask the publisher which is the preferred route and whether a DIRECT relationship is available.",
+                            evidence=Evidence(line_no=line_no, line=line),
+                        )
+                    )
 
-    # --- Summary stats ---
-    rel_counter = Counter(r.relationship for r in entry_records if r.relationship)
-    field_counter = Counter(r.field_count for r in entry_records)
+    # Simple metrics
+    entry_count = len(entry_rows)
+    direct_count = sum(1 for _, _, f in entry_rows if len(f) >= 3 and f[2].upper() == "DIRECT")
+    reseller_count = sum(1 for _, _, f in entry_rows if len(f) >= 3 and f[2].upper() == "RESELLER")
 
-    summary: Dict[str, Any] = {
-        "totals": {
-            "entries": total_entries,
-            "meta_lines": total_meta,
-            "all_records": len(records),
+    # Risk score (start at 100, subtract weighted findings)
+    score = 100
+    for f in findings:
+        score -= _severity_weight(f.severity)
+    score = max(0, min(100, score))
+
+    report = {
+        "meta": {
+            "generated_at": _now_iso(),
+            "source_label": source_label,
+            "version": "0.1",
         },
-        "relationships": dict(rel_counter),
-        "field_counts": dict(field_counter),
-        "missing_caid_entries": len(missing_caid),
-        "relationship_ambiguity_pairs": len(ambiguous_keys),
-        "meta_keys": dict(Counter(m.meta_key for m in meta_records if m.meta_key)),
+        "summary": {
+            "risk_score": score,
+            "risk_level": _risk_level(score),
+            "finding_count": len(findings),
+            "entry_count": entry_count,
+            "direct_count": direct_count,
+            "reseller_count": reseller_count,
+        },
+        "findings": [asdict(f) for f in findings],
     }
-
-    # Simple risk score (0–100): prioritize CRITICAL/HIGH
-    score = 0
-    if malformed or invalid_relationship or missing_domain or missing_account:
-        score += 60
-    if ambiguous_keys:
-        score += 25
-    if suspicious_domains:
-        score += 10
-    if total_entries > 0:
-        # Up to 15 points based on % missing CAID
-        score += min(15, int((len(missing_caid) / total_entries) * 15))
-    summary["risk_score_0_100"] = min(100, score)
-
-    return summary, issues
+    return report
 
 
-def to_report_json(summary: Dict[str, Any], issues: List[Dict[str, Any]]) -> str:
-    return json.dumps({"summary": summary, "issues": issues}, indent=2)
+def report_to_json_bytes(report: Dict) -> bytes:
+    return json.dumps(report, indent=2, ensure_ascii=False).encode("utf-8")
+
+
+def report_to_txt_bytes(report: Dict) -> bytes:
+    s = StringIO()
+    sm = report.get("summary", {})
+    meta = report.get("meta", {})
+    s.write(f"AdChainAudit report\n")
+    s.write(f"Source: {meta.get('source_label','ads.txt')}\n")
+    s.write(f"Generated: {meta.get('generated_at','')}\n\n")
+    s.write(f"Risk score: {sm.get('risk_score')} ({sm.get('risk_level')})\n")
+    s.write(f"Entries: {sm.get('entry_count')} | Findings: {sm.get('finding_count')}\n")
+    s.write(f"DIRECT: {sm.get('direct_count')} | RESELLER: {sm.get('reseller_count')}\n\n")
+
+    findings = report.get("findings", [])
+    if not findings:
+        s.write("No findings.\n")
+    else:
+        for i, f in enumerate(findings, start=1):
+            ev = f.get("evidence", {})
+            s.write(f"{i}. [{f.get('severity')}] {f.get('title')}\n")
+            s.write(f"   Why buyer cares: {f.get('why_buyer_cares')}\n")
+            if ev.get("line_no") is not None:
+                s.write(f"   Evidence: Line {ev.get('line_no')}: {ev.get('line','')}\n")
+            rec = f.get("recommendation")
+            if rec:
+                s.write(f"   What to do: {rec}\n")
+            s.write("\n")
+
+    return s.getvalue().encode("utf-8")
+
+
+def report_to_csv_bytes(report: Dict) -> bytes:
+    output = StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["severity", "rule_id", "title", "line_no", "line", "why_buyer_cares", "recommendation"])
+    for f in report.get("findings", []):
+        ev = f.get("evidence", {})
+        writer.writerow(
+            [
+                f.get("severity", ""),
+                f.get("rule_id", ""),
+                f.get("title", ""),
+                ev.get("line_no", ""),
+                ev.get("line", ""),
+                f.get("why_buyer_cares", ""),
+                f.get("recommendation", ""),
+            ]
+        )
+    return output.getvalue().encode("utf-8")
