@@ -7,49 +7,31 @@ import re
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple, List
+from typing import Any, Dict, Optional, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 import streamlit as st
 
-# Phase 1
 from analyzer import analyze_ads_txt, report_to_csv_bytes, report_to_json_bytes, report_to_txt_bytes
 
-# Phase 2 (optional import safety)
 try:
     from phase2_sellers_json import run_sellers_json_verification  # type: ignore
-except Exception:  # pragma: no cover
+except Exception:
     run_sellers_json_verification = None  # type: ignore
 
-# Phase 3
-try:
-    from phase3_schain import analyze_schain, report_to_json_bytes as schain_report_to_json_bytes  # type: ignore
-except Exception:  # pragma: no cover
-    analyze_schain = None  # type: ignore
-    schain_report_to_json_bytes = None  # type: ignore
-
-# Portfolio
-from portfolio_scanner import (
-    run_portfolio_scan,
-    portfolio_rows_to_csv_bytes,
-    report_to_json_bytes as portfolio_report_to_json_bytes,
-)
+from phase3_schain import parse_schain_text, analyze_schain
 
 
-APP_VERSION = "1.0"
+APP_VERSION = "0.9"
 EVIDENCE_DIR = Path("evidence")
 SAMPLES_DIR = Path("samples")
-
 DEMO_ADS_PATH = SAMPLES_DIR / "ads.txt"
-DEMO_SCHAIN_PATH = SAMPLES_DIR / "schain.json"
+DEMO_SCHAIN_PATH = SAMPLES_DIR / "schain_sample.json"
 
 DEMO_SNAPSHOT_NOTE = (
     "Sample snapshot source: thestar.com.my/ads.txt (captured 14 Dec 2025). "
     "ads.txt changes over time; treat this as a demo input."
-)
-DEMO_SCHAIN_NOTE = (
-    "Demo schain is a multi-hop example for learning. Real schain values usually come from bid requests / logs."
 )
 
 
@@ -81,7 +63,7 @@ def build_ads_txt_candidates(domain_or_url: str) -> Tuple[str, ...]:
         return tuple()
 
     if _looks_like_url(s):
-        url = s[:-1] if s.endswith("/") else s
+        url = s.rstrip("/")
         if not url.lower().endswith(".txt"):
             url = url + "/ads.txt"
         http_variant = re.sub(r"^https://", "http://", url, flags=re.I)
@@ -113,6 +95,7 @@ def fetch_text(url: str, timeout_s: int = 8) -> Tuple[Optional[str], Dict[str, A
         ),
         "Accept": "text/plain,text/*;q=0.9,*/*;q=0.8",
     }
+
     req = Request(url=url, headers=headers, method="GET")
     try:
         with urlopen(req, timeout=timeout_s) as resp:
@@ -139,6 +122,7 @@ def fetch_text(url: str, timeout_s: int = 8) -> Tuple[Optional[str], Dict[str, A
 def fetch_ads_txt(domain_or_url: str) -> Tuple[Optional[str], Dict[str, Any]]:
     candidates = build_ads_txt_candidates(domain_or_url)
     debug: Dict[str, Any] = {"attempts": [], "chosen": None}
+
     for u in candidates:
         text, meta = fetch_text(u)
         debug["attempts"].append(meta)
@@ -177,52 +161,14 @@ def zip_dir_bytes(folder: Path) -> bytes:
     return buf.getvalue()
 
 
-def call_sellers_verification(ads_txt_text: str) -> Optional[Dict[str, Any]]:
-    if run_sellers_json_verification is None:
-        return None
-
-    fn = run_sellers_json_verification
-    for kwargs in [
-        {"ads_txt_text": ads_txt_text, "max_domains": 25, "timeout_s": 6, "source_label": "ads.txt", "evidence_locker_enabled": False},
-        {"ads_txt_text": ads_txt_text},
-        {},
-    ]:
-        try:
-            if kwargs:
-                return fn(**kwargs)  # type: ignore[arg-type]
-            return fn(ads_txt_text)  # type: ignore[misc]
-        except TypeError:
-            continue
-        except Exception as e:
-            return {
-                "summary": {"error": str(e)},
-                "domain_stats": [],
-                "findings": [
-                    {
-                        "severity": "MEDIUM",
-                        "title": "Seller verification failed",
-                        "why_buyer_cares": "Seller verification could not be completed in this run.",
-                        "recommendation": "Try again, or proceed with Phase 1 signals only.",
-                        "evidence": {"line_no": None, "line": str(e)},
-                        "rule_id": "SELLERS_JSON_RUNTIME_ERROR",
-                    }
-                ],
-            }
-
-    return {"summary": {"error": "Could not call run_sellers_json_verification."}, "domain_stats": [], "findings": []}
-
-
-# -----------------------------
-# Evidence locker
-# -----------------------------
-def evidence_write_single_run(
+def evidence_write_run(
     *,
     ads_txt_text: str,
     source_label: str,
     audit_report: Dict[str, Any],
     sellers_report: Optional[Dict[str, Any]],
     fetch_debug: Optional[Dict[str, Any]],
-    schain_json_text: Optional[str],
+    schain_text: Optional[str],
     schain_report: Optional[Dict[str, Any]],
 ) -> Optional[Path]:
     try:
@@ -248,95 +194,53 @@ def evidence_write_single_run(
                 encoding="utf-8",
             )
 
-        # Phase 3 evidence locker
-        if schain_json_text:
-            (run_dir / "input_schain.json").write_text(schain_json_text, encoding="utf-8", errors="ignore")
-        if schain_report is not None:
+        if schain_text and schain_report:
+            (run_dir / "input_schain.json").write_text(schain_text, encoding="utf-8", errors="ignore")
             (run_dir / "schain_report.json").write_text(
                 json.dumps(schain_report, indent=2, ensure_ascii=False),
                 encoding="utf-8",
             )
-            controls = (schain_report or {}).get("controls", {}) or {}
-            (run_dir / "schain_controls.json").write_text(
-                json.dumps(controls, indent=2, ensure_ascii=False),
-                encoding="utf-8",
-            )
+            dot = schain_report.get("graphviz_dot")
+            if dot:
+                (run_dir / "schain_graph.dot").write_text(dot, encoding="utf-8")
 
         return run_dir
     except Exception:
         return None
 
 
-def evidence_write_portfolio_run(portfolio_report: Dict[str, Any]) -> Optional[Path]:
-    """
-    Stores:
-      evidence/portfolio_<ts>/
-        portfolio_report.json
-        portfolio_results.csv
-        domains/<domain>/input_ads.txt + audit_report.json + sellers_verification.json + fetch_debug.json
-    """
-    try:
-        EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
-        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        root = EVIDENCE_DIR / f"{ts}_portfolio"
-        root.mkdir(parents=True, exist_ok=True)
-
-        (root / "portfolio_report.json").write_text(
-            json.dumps(portfolio_report, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
-
-        rows = (portfolio_report or {}).get("rows", []) or []
-        (root / "portfolio_results.csv").write_bytes(portfolio_rows_to_csv_bytes(rows))
-
-        domains_dir = root / "domains"
-        domains_dir.mkdir(parents=True, exist_ok=True)
-
-        artifacts = (portfolio_report or {}).get("artifacts", {}) or {}
-        for dom, art in artifacts.items():
-            safe_dom = re.sub(r"[^a-zA-Z0-9._-]+", "_", (dom or "domain").strip())[:120]
-            ddir = domains_dir / safe_dom
-            ddir.mkdir(parents=True, exist_ok=True)
-
-            # fetch debug
-            if art.get("fetch_debug") is not None:
-                (ddir / "fetch_debug.json").write_text(
-                    json.dumps(art["fetch_debug"], indent=2, ensure_ascii=False),
-                    encoding="utf-8",
-                )
-            # input ads
-            if art.get("ads_txt_text"):
-                (ddir / "input_ads.txt").write_text(art["ads_txt_text"], encoding="utf-8", errors="ignore")
-            # audit report
-            if art.get("audit_report") is not None:
-                (ddir / "audit_report.json").write_text(
-                    json.dumps(art["audit_report"], indent=2, ensure_ascii=False),
-                    encoding="utf-8",
-                )
-            # sellers report
-            if art.get("sellers_report") is not None:
-                (ddir / "sellers_verification.json").write_text(
-                    json.dumps(art["sellers_report"], indent=2, ensure_ascii=False),
-                    encoding="utf-8",
-                )
-
-        return root
-    except Exception:
+def call_sellers_verification(ads_txt_text: str) -> Optional[Dict[str, Any]]:
+    if run_sellers_json_verification is None:
         return None
+    try:
+        return run_sellers_json_verification(ads_txt_text)
+    except Exception as e:
+        return {
+            "summary": {"error": str(e)},
+            "domain_stats": [],
+            "findings": [
+                {
+                    "severity": "MEDIUM",
+                    "title": "Seller verification failed",
+                    "why_buyer_cares": "Seller verification could not be completed in this run.",
+                    "recommendation": "Try again, or proceed with Phase 1 signals only.",
+                    "evidence": {"line_no": None, "line": str(e)},
+                    "rule_id": "SELLERS_JSON_RUNTIME_ERROR",
+                }
+            ],
+        }
 
 
 # -----------------------------
-# UI styling
+# UI
 # -----------------------------
 st.set_page_config(page_title="AdChainAudit", page_icon="🛡️", layout="wide")
 
 st.markdown(
     """
 <style>
-.block-container { padding-top: 1.1rem; padding-bottom: 2rem; max-width: 1200px; }
+.block-container { padding-top: 1.25rem; padding-bottom: 2rem; max-width: 1200px; }
 h1, h2, h3 { letter-spacing: -0.02em; }
-small, .stCaption { opacity: 0.92; }
-
 .card {
   border: 1px solid rgba(49, 51, 63, 0.12);
   border-radius: 16px;
@@ -346,7 +250,6 @@ small, .stCaption { opacity: 0.92; }
 }
 .card-title { font-weight: 800; font-size: 0.95rem; margin-bottom: 10px; opacity: 0.95; }
 .muted { opacity: 0.7; }
-
 .pill {
   display: inline-block;
   padding: 6px 10px;
@@ -361,58 +264,36 @@ small, .stCaption { opacity: 0.92; }
 .pill-ok { background: rgba(0, 128, 0, 0.08); border-color: rgba(0, 128, 0, 0.20); }
 .pill-warn { background: rgba(255, 165, 0, 0.10); border-color: rgba(255, 165, 0, 0.22); }
 .pill-bad { background: rgba(255, 0, 0, 0.08); border-color: rgba(255, 0, 0, 0.18); }
-
 .banner {
   border-radius: 14px;
   padding: 12px 14px;
   border: 1px solid rgba(49, 51, 63, 0.12);
-  background: rgba(255, 0, 0, 0.06);
-}
-.banner-ok {
   background: rgba(0,128,0,0.06);
-  border-color: rgba(0,128,0,0.18);
 }
-
-.stButton > button {
-  border-radius: 12px !important;
-  padding: 10px 14px !important;
-  font-weight: 800 !important;
-}
-
+.banner-warn { background: rgba(255,165,0,0.10); border-color: rgba(255,165,0,0.22); }
+.stButton > button { border-radius: 12px !important; padding: 10px 14px !important; font-weight: 800 !important; }
 div[data-testid="stMetricValue"] { font-size: 34px; }
 </style>
 """,
     unsafe_allow_html=True,
 )
 
-
 # -----------------------------
 # State
 # -----------------------------
-def _init_state():
-    defaults = {
-        # single scan
-        "ads_text": None,
-        "ads_source_label": None,
-        "fetch_debug": None,
-        "demo_loaded": False,
-        "audit_report": None,
-        "sellers_report": None,
-        "schain_text": None,
-        "schain_source_label": None,
-        "schain_demo_loaded": False,
-        "schain_report": None,
-        "evidence_path_single": None,
-        # portfolio
-        "portfolio_report": None,
-        "evidence_path_portfolio": None,
-    }
-    for k, v in defaults.items():
-        if k not in st.session_state:
-            st.session_state[k] = v
-
-
-_init_state()
+for k, v in {
+    "ads_text": None,
+    "ads_source_label": None,
+    "fetch_debug": None,
+    "demo_loaded": False,
+    "audit_report": None,
+    "sellers_report": None,
+    "schain_text": None,
+    "schain_report": None,
+    "evidence_path": None,
+}.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
 
 
 # -----------------------------
@@ -421,411 +302,432 @@ _init_state()
 top_l, top_r = st.columns([3, 1])
 with top_l:
     st.title("AdChainAudit")
-    st.caption("Phase 1: ads.txt audit • Phase 2: sellers.json verification • Phase 3: schain hops (optional) • Portfolio scanning")
+    st.caption("Buyer-focused supply-path sanity checks: ads.txt + sellers.json + schain (Phase 3 quick view).")
 with top_r:
     st.link_button("GitHub (technical)", "https://github.com/maazkhan86/AdChainAudit", use_container_width=True)
 
 st.write("")
 
-
 # -----------------------------
-# Tabs
+# Inputs
 # -----------------------------
-tab1, tab2 = st.tabs(["Single scan", "Portfolio scan"])
+st.subheader("Inputs")
 
-
-# =============================
-# Tab 1 — Single scan
-# =============================
-with tab1:
-    st.subheader("Inputs")
-
-    c1, c2, c3 = st.columns(3, gap="large")
-
-    with c1:
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown('<div class="card-title">1) Get ads.txt</div>', unsafe_allow_html=True)
-        domain_or_url = st.text_input(
-            "Website domain or ads.txt URL",
-            placeholder="example.com  or  https://example.com/ads.txt",
-            label_visibility="collapsed",
-            key="single_domain",
-        )
-        fetch_btn = st.button("Fetch ads.txt", use_container_width=True, key="single_fetch")
-        st.markdown('<div class="muted" style="margin-top:6px;">We try https first, then http. If blocked, upload or paste.</div>', unsafe_allow_html=True)
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    with c2:
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown('<div class="card-title">2) Upload ads.txt (optional)</div>', unsafe_allow_html=True)
-        up = st.file_uploader("Upload ads.txt", type=["txt"], label_visibility="collapsed", key="single_ads_upload")
-        demo_btn = st.button("Load demo ads.txt", use_container_width=True, key="single_demo_ads")
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    with c3:
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown('<div class="card-title">3) Paste ads.txt (optional)</div>', unsafe_allow_html=True)
-        pasted = st.text_area("Paste ads.txt", height=120, placeholder="Paste ads.txt text here…", label_visibility="collapsed", key="single_ads_paste")
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    st.write("")
-    c4, c5 = st.columns([2, 1], gap="large")
-    with c4:
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown('<div class="card-title">4) Supply chain (schain) JSON (optional)</div>', unsafe_allow_html=True)
-        schain_up = st.file_uploader("Upload schain.json", type=["json", "txt"], label_visibility="collapsed", key="single_schain_upload")
-        schain_paste = st.text_area(
-            "Paste schain JSON",
-            height=120,
-            placeholder='Paste schain object JSON like {"ver":"1.0","complete":1,"nodes":[...]}',
-            label_visibility="collapsed",
-            key="single_schain_paste",
-        )
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    with c5:
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown('<div class="card-title">Demo</div>', unsafe_allow_html=True)
-        schain_demo_btn = st.button("Load demo schain", use_container_width=True, key="single_demo_schain")
-        st.markdown('<div class="muted">Use this if you don’t have schain yet.</div>', unsafe_allow_html=True)
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    # Apply actions (single)
-    if fetch_btn:
-        if not domain_or_url.strip():
-            st.warning("Enter a website domain or full ads.txt URL.")
-        else:
-            with st.spinner("Fetching ads.txt…"):
-                text, dbg = fetch_ads_txt(domain_or_url.strip())
-            st.session_state.fetch_debug = dbg
-            if text:
-                st.session_state.ads_text = text
-                chosen = (dbg or {}).get("chosen") or domain_or_url.strip()
-                st.session_state.ads_source_label = f"fetched:{chosen}"
-                st.session_state.demo_loaded = False
-                st.success("Fetched ads.txt successfully ✅")
-            else:
-                st.error("Couldn’t fetch ads.txt (blocked or not found). Use upload/paste.")
-                with st.expander("Fetch details"):
-                    st.json(dbg)
-
-    if up is not None:
-        try:
-            raw = up.getvalue()
-            text = raw.decode("utf-8")
-        except Exception:
-            text = (up.getvalue() or b"").decode("latin-1", errors="replace")
-        st.session_state.ads_text = text
-        st.session_state.ads_source_label = f"uploaded:{up.name}"
-        st.session_state.demo_loaded = False
-        st.session_state.fetch_debug = None
-
-    if demo_btn:
-        if DEMO_ADS_PATH.exists():
-            demo_text = DEMO_ADS_PATH.read_text(encoding="utf-8", errors="ignore")
-            st.session_state.ads_text = demo_text
-            st.session_state.ads_source_label = "demo:samples/ads.txt"
-            st.session_state.demo_loaded = True
-            st.session_state.fetch_debug = None
-        else:
-            st.error("Demo ads.txt not found at ./samples/ads.txt")
-
-    if pasted and pasted.strip():
-        st.session_state.ads_text = pasted.strip()
-        st.session_state.ads_source_label = "pasted:textarea"
-        st.session_state.demo_loaded = False
-        st.session_state.fetch_debug = None
-
-    # schain apply
-    if schain_up is not None:
-        try:
-            raw = schain_up.getvalue()
-            stext = raw.decode("utf-8")
-        except Exception:
-            stext = (schain_up.getvalue() or b"").decode("latin-1", errors="replace")
-        st.session_state.schain_text = stext.strip()
-        st.session_state.schain_source_label = f"uploaded:{schain_up.name}"
-        st.session_state.schain_demo_loaded = False
-
-    if schain_paste and schain_paste.strip():
-        st.session_state.schain_text = schain_paste.strip()
-        st.session_state.schain_source_label = "pasted:schain"
-        st.session_state.schain_demo_loaded = False
-
-    if schain_demo_btn:
-        if DEMO_SCHAIN_PATH.exists():
-            stext = DEMO_SCHAIN_PATH.read_text(encoding="utf-8", errors="ignore")
-            st.session_state.schain_text = stext.strip()
-            st.session_state.schain_source_label = "demo:samples/schain.json"
-            st.session_state.schain_demo_loaded = True
-        else:
-            st.error("Demo schain not found at ./samples/schain.json")
-
-    # Indicators
-    st.write("")
-    ads_text = st.session_state.ads_text
-    src = st.session_state.ads_source_label
-    if st.session_state.demo_loaded:
-        st.markdown(f'<div class="banner"><b>Demo ads.txt loaded ✅</b><br/>{DEMO_SNAPSHOT_NOTE}</div>', unsafe_allow_html=True)
-    elif ads_text:
-        st.markdown(f'<div class="banner banner-ok"><b>ads.txt ready ✅</b><br/><span class="muted">Source: {src}</span></div>', unsafe_allow_html=True)
-    else:
-        st.info("Add ads.txt input to run Phase 1 + 2.")
-
-    schain_text = st.session_state.schain_text
-    schain_src = st.session_state.schain_source_label
-    if st.session_state.schain_demo_loaded:
-        st.markdown(f'<div class="banner"><b>Demo schain loaded ✅</b><br/>{DEMO_SCHAIN_NOTE}</div>', unsafe_allow_html=True)
-    elif schain_text:
-        st.markdown(f'<div class="banner banner-ok"><b>schain ready ✅</b><br/><span class="muted">Source: {schain_src}</span></div>', unsafe_allow_html=True)
-
-    st.write("")
-    run = st.button("Run audit", type="primary", use_container_width=True, key="single_run")
-    st.divider()
-
-    if run:
-        if not ads_text:
-            st.warning("Please provide ads.txt first.")
-        else:
-            with st.spinner("Analyzing ads.txt…"):
-                audit_report = analyze_ads_txt(
-                    text=ads_text,
-                    source_label=src or "ads.txt",
-                    include_optional_checks=True,
-                )
-
-            with st.spinner("Verifying seller accounts (sellers.json)…"):
-                sellers_report = call_sellers_verification(ads_text)
-
-            schain_report = None
-            if schain_text and analyze_schain is not None:
-                with st.spinner("Auditing supply chain hops (schain)…"):
-                    schain_report = analyze_schain(
-                        schain_json_text=schain_text,
-                        source_label=schain_src or "schain",
-                        ads_txt_text=ads_text,
-                    )
-
-            st.session_state.audit_report = audit_report
-            st.session_state.sellers_report = sellers_report
-            st.session_state.schain_report = schain_report
-
-            ev_path = evidence_write_single_run(
-                ads_txt_text=ads_text,
-                source_label=src or "ads.txt",
-                audit_report=audit_report,
-                sellers_report=sellers_report,
-                fetch_debug=st.session_state.fetch_debug,
-                schain_json_text=schain_text,
-                schain_report=schain_report,
-            )
-            st.session_state.evidence_path_single = ev_path
-
-    # Results (single) – keep your existing layout compact
-    audit_report = st.session_state.audit_report
-    sellers_report = st.session_state.sellers_report
-    schain_report = st.session_state.schain_report
-    ev_path = st.session_state.evidence_path_single
-
-    if audit_report:
-        st.subheader("Phase 1 — ads.txt audit")
-        sm = audit_report.get("summary", {}) or {}
-        risk_score = clamp_int(sm.get("risk_score"), 0, 100, 0)
-        risk_level = pretty_level(sm.get("risk_level"))
-        findings_count = clamp_int(sm.get("finding_count"), 0, 10**9, 0)
-        entry_count = clamp_int(sm.get("entry_count"), 0, 10**9, 0)
-
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Risk score", risk_score)
-        m2.metric("Risk level", risk_level)
-        m3.metric("Findings", findings_count)
-        m4.metric("Entries", entry_count)
-
-        dl1, dl2, dl3, dl4 = st.columns([1, 1, 1, 2], gap="small")
-        with dl1:
-            st.download_button("Download JSON", data=report_to_json_bytes(audit_report),
-                               file_name="adchainaudit_report.json", mime="application/json", use_container_width=True)
-        with dl2:
-            st.download_button("Download TXT", data=report_to_txt_bytes(audit_report),
-                               file_name="adchainaudit_report.txt", mime="text/plain", use_container_width=True)
-        with dl3:
-            st.download_button("Download CSV", data=report_to_csv_bytes(audit_report),
-                               file_name="adchainaudit_findings.csv", mime="text/csv", use_container_width=True)
-        with dl4:
-            if ev_path and Path(ev_path).exists():
-                st.download_button("Download buyer pack (ZIP)", data=zip_dir_bytes(Path(ev_path)),
-                                   file_name=f"{Path(ev_path).name}.zip", mime="application/zip", use_container_width=True)
-            else:
-                st.button("Download buyer pack (ZIP)", disabled=True, use_container_width=True)
-
-        st.divider()
-
-    if sellers_report:
-        st.subheader("Phase 2 — sellers.json verification (summary)")
-        ssum = sellers_report.get("summary", {}) or {}
-        p1, p2, p3, p4 = st.columns(4)
-        p1.metric("Systems checked", clamp_int(ssum.get("domains_checked"), 0, 10**9, 0))
-        p2.metric("Reachable", clamp_int(ssum.get("reachable"), 0, 10**9, 0))
-        p3.metric("Unreachable", clamp_int(ssum.get("unreachable"), 0, 10**9, 0))
-        p4.metric("Avg match rate", safe_pct(ssum.get("avg_match_rate")))
-        st.divider()
-
-    if schain_report:
-        st.subheader("Phase 3 — schain audit (summary)")
-        ssum = schain_report.get("summary", {}) or {}
-        a1, a2, a3, a4 = st.columns(4)
-        a1.metric("SPO score", clamp_int(ssum.get("spo_score"), 0, 100, 0))
-        a2.metric("SPO risk", pretty_level(ssum.get("spo_risk_level")))
-        a3.metric("Hops", clamp_int(ssum.get("hop_count"), 0, 10**6, 0))
-        a4.metric("Complete", "Yes" if clamp_int(ssum.get("complete"), 0, 1, 0) == 1 else "No")
-
-        dot = schain_report.get("dot", "")
-        if dot:
-            st.graphviz_chart(dot, use_container_width=True)
-
-        controls = schain_report.get("controls", {}) or {}
-        with st.expander("Suggested buyer controls (JSON)"):
-            st.json(controls)
-
-        if schain_report_to_json_bytes is not None:
-            st.download_button(
-                "Download schain report (JSON)",
-                data=schain_report_to_json_bytes(schain_report),
-                file_name="adchainaudit_schain_report.json",
-                mime="application/json",
-                use_container_width=True,
-            )
-
-
-# =============================
-# Tab 2 — Portfolio scan
-# =============================
-with tab2:
-    st.subheader("Portfolio scan (Phase 1 + 2)")
-    st.caption("Paste or upload a list of domains. The app will fetch ads.txt for each and produce a portfolio table + evidence ZIP.")
-
+c1, c2, c3 = st.columns(3, gap="large")
+with c1:
     st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.markdown('<div class="card-title">Domains</div>', unsafe_allow_html=True)
-
-    portfolio_text = st.text_area(
-        "Paste domains (one per line)",
-        height=140,
-        placeholder="example.com\npublisher2.com\npublisher3.com",
-        label_visibility="collapsed",
-        key="portfolio_text",
-    )
-    portfolio_up = st.file_uploader("Or upload a .txt/.csv with one domain per line", type=["txt", "csv"], label_visibility="collapsed", key="portfolio_upload")
-    max_domains = st.slider("Max domains per run", min_value=5, max_value=50, value=25, step=5)
-
+    st.markdown('<div class="card-title">1) Fetch ads.txt</div>', unsafe_allow_html=True)
+    domain_or_url = st.text_input("Website domain or ads.txt URL", placeholder="example.com", label_visibility="collapsed")
+    fetch_btn = st.button("Fetch ads.txt", use_container_width=True)
+    st.markdown('<div class="muted" style="margin-top:6px;">We try https then http. If blocked, upload or paste.</div>', unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
-    def _parse_portfolio_inputs() -> List[str]:
-        domains: List[str] = []
-        if portfolio_up is not None:
-            raw = portfolio_up.getvalue() or b""
-            try:
-                text = raw.decode("utf-8")
-            except Exception:
-                text = raw.decode("latin-1", errors="replace")
-            for line in text.splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                # allow CSV with domain in first column
-                if "," in line:
-                    line = line.split(",", 1)[0].strip()
-                domains.append(line)
+with c2:
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown('<div class="card-title">2) Upload ads.txt (optional)</div>', unsafe_allow_html=True)
+    up = st.file_uploader("Upload ads.txt", type=["txt"], label_visibility="collapsed")
+    demo_btn = st.button("Load demo ads.txt", use_container_width=True)
+    st.markdown("</div>", unsafe_allow_html=True)
 
-        if portfolio_text and portfolio_text.strip():
-            for line in portfolio_text.splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                if "," in line:
-                    line = line.split(",", 1)[0].strip()
-                domains.append(line)
+with c3:
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown('<div class="card-title">3) Paste ads.txt (optional)</div>', unsafe_allow_html=True)
+    pasted = st.text_area("Paste ads.txt", height=120, placeholder="Paste ads.txt text here…", label_visibility="collapsed")
+    st.markdown("</div>", unsafe_allow_html=True)
 
-        # de-dupe preserve order
-        seen = set()
-        out: List[str] = []
-        for d in domains:
-            if d in seen:
-                continue
-            seen.add(d)
-            out.append(d)
-        return out
+# schain inputs
+st.write("")
+s1, s2, s3 = st.columns(3, gap="large")
+with s1:
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown('<div class="card-title">4) Upload schain JSON (optional)</div>', unsafe_allow_html=True)
+    sch_up = st.file_uploader("Upload schain JSON", type=["json", "txt"], label_visibility="collapsed", key="sch_up")
+    sch_demo_btn = st.button("Load demo schain", use_container_width=True)
+    st.markdown("</div>", unsafe_allow_html=True)
 
-    domains_list = _parse_portfolio_inputs()
-    st.write(f"Domains loaded: **{len(domains_list)}**")
+with s2:
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown('<div class="card-title">5) Paste schain JSON (optional)</div>', unsafe_allow_html=True)
+    sch_paste = st.text_area("Paste schain JSON", height=120, placeholder='{"ver":"1.0","complete":0,"nodes":[...]}', label_visibility="collapsed")
+    st.markdown("</div>", unsafe_allow_html=True)
 
-    run_portfolio = st.button("Run portfolio scan", type="primary", use_container_width=True, key="portfolio_run")
+with s3:
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown('<div class="card-title">Run</div>', unsafe_allow_html=True)
+    run = st.button("Run audit", type="primary", use_container_width=True)
+    st.markdown('<div class="muted" style="margin-top:6px;">Phase 2 (sellers.json) + optional signals are ON by default.</div>', unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
 
-    if run_portfolio:
-        if not domains_list:
-            st.warning("Add at least one domain.")
+# Actions: ads.txt
+if fetch_btn:
+    if not domain_or_url.strip():
+        st.warning("Enter a website domain or full ads.txt URL first.")
+    else:
+        with st.spinner("Fetching ads.txt…"):
+            text, dbg = fetch_ads_txt(domain_or_url.strip())
+        st.session_state.fetch_debug = dbg
+        if text:
+            st.session_state.ads_text = text
+            chosen = (dbg or {}).get("chosen") or domain_or_url.strip()
+            st.session_state.ads_source_label = f"fetched:{chosen}"
+            st.session_state.demo_loaded = False
+            st.success("Fetched ads.txt successfully ✅")
         else:
-            progress = st.progress(0)
-            status = st.empty()
+            st.error("Couldn’t fetch ads.txt (blocked or not found). Use upload or paste instead.")
+            with st.expander("Fetch details (troubleshooting)"):
+                st.json(dbg)
 
-            # We run the portfolio scan, but also show user progress using the artifacts count.
-            # run_portfolio_scan itself is sequential; we update progress by estimating completion per domain.
-            # For simplicity, run it once, then show results.
-            status.write("Running portfolio scan…")
-            report = run_portfolio_scan(
-                domains=domains_list,
-                analyze_ads_txt_fn=analyze_ads_txt,
-                sellers_verify_fn=run_sellers_json_verification,
-                timeout_s=8,
-                include_optional_checks=True,
-                include_phase2=True,
-                max_domains=int(max_domains),
+if up is not None:
+    try:
+        st.session_state.ads_text = up.getvalue().decode("utf-8")
+    except Exception:
+        st.session_state.ads_text = (up.getvalue() or b"").decode("latin-1", errors="replace")
+    st.session_state.ads_source_label = f"uploaded:{up.name}"
+    st.session_state.demo_loaded = False
+    st.session_state.fetch_debug = None
+
+if demo_btn:
+    if DEMO_ADS_PATH.exists():
+        st.session_state.ads_text = DEMO_ADS_PATH.read_text(encoding="utf-8", errors="ignore")
+        st.session_state.ads_source_label = "demo:samples/ads.txt"
+        st.session_state.demo_loaded = True
+        st.session_state.fetch_debug = None
+    else:
+        st.error("Demo ads.txt not found at ./samples/ads.txt")
+
+if pasted and pasted.strip():
+    st.session_state.ads_text = pasted.strip()
+    st.session_state.ads_source_label = "pasted:textarea"
+    st.session_state.demo_loaded = False
+    st.session_state.fetch_debug = None
+
+# Actions: schain
+if sch_up is not None:
+    try:
+        st.session_state.schain_text = sch_up.getvalue().decode("utf-8")
+    except Exception:
+        st.session_state.schain_text = (sch_up.getvalue() or b"").decode("latin-1", errors="replace")
+
+if sch_demo_btn:
+    if DEMO_SCHAIN_PATH.exists():
+        st.session_state.schain_text = DEMO_SCHAIN_PATH.read_text(encoding="utf-8", errors="ignore")
+        st.success("Demo schain loaded ✅")
+    else:
+        st.error("Demo schain not found at ./samples/schain_sample.json")
+
+if sch_paste and sch_paste.strip():
+    st.session_state.schain_text = sch_paste.strip()
+
+# Input banners
+st.write("")
+if st.session_state.ads_text:
+    src = st.session_state.ads_source_label or "ads.txt"
+    note = DEMO_SNAPSHOT_NOTE if st.session_state.demo_loaded else f"Source: {src}"
+    st.markdown(f'<div class="banner"><b>ads.txt ready ✅</b><br/><span class="muted">{note}</span></div>', unsafe_allow_html=True)
+else:
+    st.markdown('<div class="banner banner-warn"><b>ads.txt missing</b><br/><span class="muted">Add an ads.txt input to run the audit.</span></div>', unsafe_allow_html=True)
+
+if st.session_state.schain_text:
+    st.markdown('<div class="banner"><b>schain ready ✅</b><br/><span class="muted">Phase 3 quick view will run if JSON is valid.</span></div>', unsafe_allow_html=True)
+
+st.divider()
+
+# -----------------------------
+# Run
+# -----------------------------
+if run:
+    if not st.session_state.ads_text:
+        st.warning("Please add ads.txt input first (fetch, upload, or paste).")
+    else:
+        ads_text = st.session_state.ads_text
+        src = st.session_state.ads_source_label or "ads.txt"
+
+        with st.spinner("Analyzing ads.txt…"):
+            audit_report = analyze_ads_txt(
+                text=ads_text,
+                source_label=src,
+                include_optional_checks=True,  # hardcoded ON
             )
-            progress.progress(100)
-            status.write("Done ✅")
 
-            st.session_state.portfolio_report = report
-            evp = evidence_write_portfolio_run(report)
-            st.session_state.evidence_path_portfolio = evp
+        with st.spinner("Verifying seller accounts (sellers.json)…"):
+            sellers_report = call_sellers_verification(ads_text)
 
-    portfolio_report = st.session_state.portfolio_report
-    if portfolio_report:
-        st.subheader("Portfolio results")
-        summ = portfolio_report.get("summary", {}) or {}
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Scanned", summ.get("domains_scanned", 0))
-        c2.metric("Fetched OK", summ.get("fetched_ok", 0))
-        c3.metric("Fetch failed", summ.get("fetched_failed", 0))
-        c4.metric("Avg risk", summ.get("avg_risk_score", "—"))
+        schain_report = None
+        sch_text = st.session_state.schain_text
+        if sch_text and sch_text.strip():
+            with st.spinner("Parsing schain (Phase 3 quick view)…"):
+                sch_obj, err = parse_schain_text(sch_text)
+                if err:
+                    schain_report = {
+                        "meta": {"generated_at": now_iso(), "source_label": "schain", "version": "0.1-phase3-quickview"},
+                        "summary": {"error": err},
+                        "nodes": [],
+                        "findings": [],
+                    }
+                else:
+                    schain_report = analyze_schain(
+                        sch_obj, source_label="schain", ads_txt_text=ads_text
+                    )
 
-        rows = portfolio_report.get("rows", []) or []
+        st.session_state.audit_report = audit_report
+        st.session_state.sellers_report = sellers_report
+        st.session_state.schain_report = schain_report
+
+        ev_path = evidence_write_run(
+            ads_txt_text=ads_text,
+            source_label=src,
+            audit_report=audit_report,
+            sellers_report=sellers_report,
+            fetch_debug=st.session_state.fetch_debug,
+            schain_text=sch_text,
+            schain_report=schain_report,
+        )
+        st.session_state.evidence_path = ev_path
+
+# -----------------------------
+# Results
+# -----------------------------
+audit_report = st.session_state.audit_report
+sellers_report = st.session_state.sellers_report
+schain_report = st.session_state.schain_report
+
+if audit_report:
+    st.subheader("Phase 1 — ads.txt audit")
+
+    sm = audit_report.get("summary", {}) or {}
+    risk_score = clamp_int(sm.get("risk_score"), 0, 100, 0)
+    risk_level = pretty_level(sm.get("risk_level"))
+    findings_count = clamp_int(sm.get("finding_count"), 0, 10**9, 0)
+    entry_count = clamp_int(sm.get("entry_count"), 0, 10**9, 0)
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Risk score", risk_score)
+    m2.metric("Risk level", risk_level)
+    m3.metric("Findings", findings_count)
+    m4.metric("Entries", entry_count)
+
+    # Key takeaways
+    top_rules = sm.get("top_rules", []) or []
+    st.markdown("### Key takeaways")
+    if top_rules:
+        # Take top 3 issues
+        bullets = []
+        for r in top_rules[:3]:
+            bullets.append(f"- **{r.get('rule_id')}** ({r.get('severity')}) — {r.get('count')} occurrences")
+        st.markdown("\n".join(bullets))
+    else:
+        st.markdown("- No major issues detected by current rules.")
+
+    # Top issues table
+    st.markdown("### Top issues (what to ask / do)")
+    if top_rules:
+        rows = []
+        for r in top_rules[:10]:
+            rid = r.get("rule_id")
+            sev = r.get("severity")
+            cnt = r.get("count")
+            action = "Ask publisher to fix formatting/authorization." if rid in {"MALFORMED_LINE", "INVALID_RELATIONSHIP"} else \
+                     "Ask for preferred DIRECT route and clarify reselling." if rid in {"RELATIONSHIP_AMBIGUITY"} else \
+                     "Optional cleanup; does not block buying." if rid == "MISSING_CAID" else \
+                     "Investigate and validate."
+            rows.append({"Rule": rid, "Severity": sev, "Count": cnt, "Buyer action": action})
         st.dataframe(rows, use_container_width=True, hide_index=True)
+    else:
+        st.info("No top issues to show.")
 
-        d1, d2, d3 = st.columns([1, 1, 2])
-        with d1:
-            st.download_button(
-                "Download CSV",
-                data=portfolio_rows_to_csv_bytes(rows),
-                file_name="portfolio_results.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
-        with d2:
-            st.download_button(
-                "Download JSON",
-                data=portfolio_report_to_json_bytes(portfolio_report),
-                file_name="portfolio_results.json",
-                mime="application/json",
-                use_container_width=True,
-            )
-        with d3:
-            evp = st.session_state.evidence_path_portfolio
-            if evp and Path(evp).exists():
-                st.download_button(
-                    "Download portfolio buyer pack (ZIP)",
-                    data=zip_dir_bytes(Path(evp)),
-                    file_name=f"{Path(evp).name}.zip",
-                    mime="application/zip",
-                    use_container_width=True,
-                )
-            else:
-                st.button("Download portfolio buyer pack (ZIP)", disabled=True, use_container_width=True)
+    # Top ad systems
+    st.markdown("### Top ad systems referenced in ads.txt")
+    top_domains = sm.get("top_ad_systems", []) or []
+    if top_domains:
+        st.dataframe(top_domains, use_container_width=True, hide_index=True)
+
+    # Downloads
+    dl1, dl2, dl3, dl4 = st.columns([1, 1, 1, 2], gap="small")
+    with dl1:
+        st.download_button("Download JSON", data=report_to_json_bytes(audit_report), file_name="adchainaudit_report.json",
+                           mime="application/json", use_container_width=True)
+    with dl2:
+        st.download_button("Download TXT", data=report_to_txt_bytes(audit_report), file_name="adchainaudit_report.txt",
+                           mime="text/plain", use_container_width=True)
+    with dl3:
+        st.download_button("Download CSV", data=report_to_csv_bytes(audit_report), file_name="adchainaudit_findings.csv",
+                           mime="text/csv", use_container_width=True)
+    with dl4:
+        ev_path = st.session_state.evidence_path
+        if ev_path and Path(ev_path).exists():
+            st.download_button("Download buyer pack (ZIP)", data=zip_dir_bytes(Path(ev_path)),
+                               file_name=f"{Path(ev_path).name}.zip", mime="application/zip", use_container_width=True)
+        else:
+            st.button("Download buyer pack (ZIP)", disabled=True, use_container_width=True)
+
+    # Detailed findings (kept, but not the only thing)
+    with st.expander("Detailed findings (advanced)", expanded=False):
+        findings = audit_report.get("findings", []) or []
+        # show only first 80 for UI sanity
+        max_show = 80
+        for i, f in enumerate(findings[:max_show], start=1):
+            ev = f.get("evidence", {}) or {}
+            st.markdown(f"**{i}. [{f.get('severity')}] {f.get('title')}**")
+            if f.get("why_buyer_cares"):
+                st.markdown(f"- *Why buyer cares:* {f.get('why_buyer_cares')}")
+            if f.get("recommendation"):
+                st.markdown(f"- *What to do:* {f.get('recommendation')}")
+            line = ev.get("line", "")
+            if line:
+                ln = ev.get("line_no")
+                if ln is not None:
+                    st.code(f"Line {ln}: {line}", language="text")
+                else:
+                    st.code(line, language="text")
+            st.write("")
+        if len(findings) > max_show:
+            st.info(f"Showing top {max_show} items. Download CSV for the full list.")
+
+    st.divider()
+
+# -----------------------------
+# Phase 2 summary
+# -----------------------------
+if sellers_report:
+    st.subheader("Phase 2 — sellers.json verification (summary)")
+
+    ssum = sellers_report.get("summary", {}) or {}
+    domains_checked = clamp_int(ssum.get("domains_checked"), 0, 10**9, 0)
+    reachable = clamp_int(ssum.get("reachable"), 0, 10**9, 0)
+    unreachable = clamp_int(ssum.get("unreachable"), 0, 10**9, 0)
+    avg_match = ssum.get("avg_match_rate", None)
+
+    p1, p2, p3, p4 = st.columns(4)
+    p1.metric("Systems checked", domains_checked)
+    p2.metric("Reachable", reachable)
+    p3.metric("Unreachable", unreachable)
+    p4.metric("Avg match rate", safe_pct(avg_match))
+
+    domain_stats = sellers_report.get("domain_stats", []) or []
+
+    low_match, ok_match, blocked = [], [], []
+    for d in domain_stats:
+        status = d.get("status", None)
+        json_ok = bool(d.get("json_ok", False))
+        mr = d.get("match_rate", 0) or 0
+        err = d.get("error", None)
+        if not json_ok or status is None or (isinstance(status, int) and status >= 400) or err:
+            blocked.append(d)
+        elif mr < 0.2:
+            low_match.append(d)
+        else:
+            ok_match.append(d)
+
+    st.markdown(
+        f"""
+<span class="pill pill-ok">Good/usable: {len(ok_match)}</span>
+<span class="pill pill-warn">Low match (&lt;20%): {len(low_match)}</span>
+<span class="pill pill-bad">Unreachable/not JSON: {len(blocked)}</span>
+""",
+        unsafe_allow_html=True,
+    )
+
+    reachable_rows = [d for d in domain_stats if d.get("json_ok") and d.get("status") == 200]
+    reachable_sorted = sorted(reachable_rows, key=lambda x: (x.get("match_rate") or 0))
+    worst10 = reachable_sorted[:10]
+
+    if worst10:
+        st.markdown("**Worst match (reachable sellers.json):**")
+        st.dataframe(
+            [
+                {
+                    "Domain": d.get("domain"),
+                    "Seller IDs in ads.txt": d.get("seller_ids_in_ads_txt"),
+                    "Matched": d.get("seller_ids_matched"),
+                    "Match rate": f"{(d.get('match_rate') or 0):.2f}",
+                }
+                for d in worst10
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    if blocked:
+        st.markdown("**Unreachable / blocked / not JSON (top):**")
+        st.dataframe(
+            [
+                {"Domain": d.get("domain"), "Status": d.get("status"), "Reason": (d.get("error") or "")[:140]}
+                for d in blocked[:12]
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    st.markdown("**Buyer actions**")
+    bullets = []
+    if len(low_match) > 0:
+        bullets.append(
+            f"- **{len(low_match)} systems have low match**: many seller IDs in ads.txt could not be validated. Ask for the preferred path (DIRECT where possible)."
+        )
+    if len(blocked) > 0:
+        bullets.append(
+            f"- **{len(blocked)} systems could not be verified** (blocked/unreachable/not JSON). Treat as a transparency gap; request confirmation."
+        )
+    if not bullets:
+        bullets.append("- Sellers.json verification looks healthy overall. Use this to support SPO conversations.")
+    st.markdown("\n".join(bullets))
+
+    with st.expander("Detailed seller-verification findings (advanced)"):
+        sf = sellers_report.get("findings", []) or []
+        max_show = 30
+        for i, f in enumerate(sf[:max_show], start=1):
+            st.markdown(f"**{i}. [{f.get('severity','')}] {f.get('title','')}**")
+            if f.get("why_buyer_cares"):
+                st.markdown(f"- *Why buyer cares:* {f.get('why_buyer_cares')}")
+            if f.get("recommendation"):
+                st.markdown(f"- *What to do:* {f.get('recommendation')}")
+            ev = f.get("evidence", {}) or {}
+            if ev:
+                st.code(json.dumps(ev, indent=2, ensure_ascii=False), language="json")
+            st.write("")
+        if len(sf) > max_show:
+            st.info(f"Showing top {max_show}. Download the buyer pack ZIP for full JSON.")
+
+    st.divider()
+
+# -----------------------------
+# Phase 3 quick view
+# -----------------------------
+if schain_report:
+    st.subheader("Phase 3 — schain quick view")
+
+    ssum = schain_report.get("summary", {}) or {}
+    if ssum.get("error"):
+        st.error(f"schain error: {ssum.get('error')}")
+    else:
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Hops", clamp_int(ssum.get("hops"), 0, 10**6, 0))
+        c2.metric("Complete", str(ssum.get("complete")))
+        c3.metric("Direct hops", clamp_int(ssum.get("direct_hops"), 0, 10**6, 0))
+        c4.metric("Reseller hops", clamp_int(ssum.get("reseller_hops"), 0, 10**6, 0))
+
+        dot = schain_report.get("graphviz_dot")
+        if dot:
+            st.markdown("### Supply path visualization")
+            st.graphviz_chart(dot, use_container_width=True)
+
+        st.markdown("### Nodes")
+        st.dataframe(schain_report.get("nodes", []) or [], use_container_width=True, hide_index=True)
+
+        st.markdown("### schain findings (buyer-relevant)")
+        f = schain_report.get("findings", []) or []
+        if not f:
+            st.info("No schain issues detected by current rules.")
+        else:
+            max_show = 20
+            for i, x in enumerate(f[:max_show], start=1):
+                st.markdown(f"**{i}. [{x.get('severity')}] {x.get('title')}**")
+                if x.get("why_buyer_cares"):
+                    st.markdown(f"- *Why buyer cares:* {x.get('why_buyer_cares')}")
+                if x.get("recommendation"):
+                    st.markdown(f"- *What to do:* {x.get('recommendation')}")
+                if x.get("evidence"):
+                    st.code(json.dumps(x.get("evidence"), indent=2, ensure_ascii=False), language="json")
+                st.write("")
+            if len(f) > max_show:
+                st.info(f"Showing top {max_show}. Download buyer pack ZIP for full schain report.")
