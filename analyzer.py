@@ -4,15 +4,16 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from io import StringIO
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 import csv
 import json
 import math
 
+
 ALLOWED_RELATIONSHIPS = {"DIRECT", "RESELLER"}
 
-# If you later want to expand heuristics, keep these in one place.
-SUSPICIOUS_RELATIONSHIPS = {"BOTH"}  # not valid for ads.txt but sometimes appears
+# Rule IDs that should NOT meaningfully drive the score (still shown as findings)
+NON_SCORING_RULES = {"MISSING_CAID"}
 
 
 @dataclass
@@ -36,11 +37,6 @@ def _now_iso() -> str:
 
 
 def _strip_inline_comment(line: str) -> str:
-    """
-    Remove full-line and inline comments.
-    Prevents false positives like:
-      google.com, pub-1, DIRECT # comment
-    """
     s = line.strip()
     if not s:
         return s
@@ -56,7 +52,7 @@ def _split_fields(line: str) -> List[str]:
 
 
 def _risk_level(score: int) -> str:
-    # Higher score = cleaner file = lower risk
+    # Higher score = cleaner
     if score >= 80:
         return "LOW"
     if score >= 55:
@@ -64,20 +60,19 @@ def _risk_level(score: int) -> str:
     return "HIGH"
 
 
-def _severity_weight(sev: str) -> float:
-    # Keep LOW minimal; optional signals should not crush the score.
-    return {"CRITICAL": 10.0, "HIGH": 7.0, "MEDIUM": 4.0, "LOW": 0.8}.get(sev, 0.8)
+def _severity_weight(sev: str) -> int:
+    return {"CRITICAL": 10, "HIGH": 7, "MEDIUM": 4, "LOW": 1}.get(sev, 1)
 
 
-def _clamp(x: int, lo: int = 0, hi: int = 100) -> int:
-    return max(lo, min(hi, x))
+def _order(sev: str) -> int:
+    return {"LOW": 0, "MEDIUM": 1, "HIGH": 2, "CRITICAL": 3}.get(sev, 0)
 
 
 def analyze_ads_txt(
     text: str,
     source_label: str = "ads.txt",
-    include_optional_checks: bool = True,  # keep param for backwards compatibility
-) -> Dict:
+    include_optional_checks: bool = False,
+) -> Dict[str, Any]:
     raw_lines = text.splitlines()
 
     entry_rows: List[Tuple[int, str, List[str]]] = []
@@ -120,7 +115,7 @@ def analyze_ads_txt(
                     )
                 )
 
-    # Optional: missing CAID (4th field) - informational only (do not penalize score heavily)
+    # Optional: missing CAID (4th field)
     if include_optional_checks:
         for line_no, line, fields in entry_rows:
             if len(fields) == 3:
@@ -128,7 +123,7 @@ def analyze_ads_txt(
                     Finding(
                         rule_id="MISSING_CAID",
                         severity="LOW",
-                        title="Missing CAID field (optional signal)",
+                        title="Missing Certification Authority ID (CAID) field (optional signal)",
                         why_buyer_cares="CAID can help with verification at scale, but many publishers omit it today.",
                         recommendation="Optional: ask the publisher/seller to include CAID where applicable.",
                         evidence=Evidence(line_no=line_no, line=line),
@@ -164,60 +159,49 @@ def analyze_ads_txt(
     direct_count = sum(1 for _, _, f in entry_rows if len(f) >= 3 and f[2].upper() == "DIRECT")
     reseller_count = sum(1 for _, _, f in entry_rows if len(f) >= 3 and f[2].upper() == "RESELLER")
 
-    # Heuristic: reseller-heavy file (not always bad, but worth asking)
-    if entry_count >= 20:
-        reseller_share = reseller_count / max(1, entry_count)
-        if reseller_share >= 0.75:
-            findings.append(
-                Finding(
-                    rule_id="RESELLER_HEAVY",
-                    severity="MEDIUM",
-                    title="Reseller-heavy ads.txt",
-                    why_buyer_cares="A reseller-heavy setup can mean more hops, more fees, and less path control (not always wrong, but worth clarifying).",
-                    recommendation="Ask for preferred DIRECT paths (if available) and which resellers are required vs legacy.",
-                    evidence=Evidence(line_no=None, line=f"RESELLER share ≈ {round(reseller_share, 2)}"),
-                )
-            )
+    # Domain counts (useful buyer summary)
+    domain_counts: Dict[str, int] = {}
+    for _, _, f in entry_rows:
+        if len(f) >= 1 and f[0]:
+            d = f[0].strip().lower()
+            domain_counts[d] = domain_counts.get(d, 0) + 1
+
+    top_domains = sorted(domain_counts.items(), key=lambda x: x[1], reverse=True)[:12]
+    top_domains_rows = [{"domain": d, "entries": c} for d, c in top_domains]
 
     # Scoring: aggregate by rule with diminishing returns
     rule_counts: Dict[str, int] = {}
     rule_severity: Dict[str, str] = {}
-    order = {"CRITICAL": 3, "HIGH": 2, "MEDIUM": 1, "LOW": 0}
 
     for f in findings:
         rule_counts[f.rule_id] = rule_counts.get(f.rule_id, 0) + 1
         if f.rule_id not in rule_severity:
             rule_severity[f.rule_id] = f.severity
         else:
-            if order.get(f.severity, 0) > order.get(rule_severity[f.rule_id], 0):
+            if _order(f.severity) > _order(rule_severity[f.rule_id]):
                 rule_severity[f.rule_id] = f.severity
 
     penalty = 0.0
     for rid, cnt in rule_counts.items():
         sev = rule_severity.get(rid, "LOW")
 
-        # IMPORTANT: MISSING_CAID is informational; barely affect score.
-        if rid == "MISSING_CAID":
-            penalty += 0.15 * math.log1p(cnt)
+        # IMPORTANT: keep optional/noise rules from crushing the score
+        if rid in NON_SCORING_RULES:
             continue
 
-        penalty += _severity_weight(sev) * math.log1p(cnt)
+        # cap a single rule’s impact so huge files don’t always go to zero
+        rule_pen = _severity_weight(sev) * math.log1p(cnt)
+        penalty += min(rule_pen, 12.0)
 
     score = int(round(100 - (penalty * 6)))
-    score = _clamp(score)
+    score = max(0, min(100, score))
 
-    # Buyer-friendly highlights
-    highlights: List[str] = []
-    if rule_counts.get("MALFORMED_LINE"):
-        highlights.append(f"{rule_counts['MALFORMED_LINE']} malformed line(s) to fix.")
-    if rule_counts.get("INVALID_RELATIONSHIP"):
-        highlights.append("Some lines use invalid relationship values (should be DIRECT/RESELLER).")
-    if rule_counts.get("RELATIONSHIP_AMBIGUITY"):
-        highlights.append("Some seller accounts appear as both DIRECT and RESELLER (ask which path is preferred).")
-    if rule_counts.get("RESELLER_HEAVY"):
-        highlights.append("File is reseller-heavy (worth asking for more DIRECT paths where possible).")
-    if not highlights:
-        highlights.append("No obvious structural red flags detected from ads.txt formatting rules.")
+    # Top rules list
+    top_rules = sorted(
+        [{"rule_id": rid, "count": cnt, "severity": rule_severity.get(rid, "LOW")} for rid, cnt in rule_counts.items()],
+        key=lambda x: (_order(x["severity"]), x["count"]),
+        reverse=True,
+    )[:10]
 
     return {
         "meta": {
@@ -234,7 +218,8 @@ def analyze_ads_txt(
             "direct_count": direct_count,
             "reseller_count": reseller_count,
             "rule_counts": rule_counts,
-            "highlights": highlights,
+            "top_rules": top_rules,
+            "top_ad_systems": top_domains_rows,
         },
         "findings": [asdict(f) for f in findings],
     }
@@ -250,23 +235,17 @@ def report_to_txt_bytes(report: Dict) -> bytes:
     meta = report.get("meta", {})
     s.write("AdChainAudit report\n")
     s.write(f"Source: {meta.get('source_label','ads.txt')}\n")
-    s.write(f"Generated: {meta.get('generated_at','')}\n\n")
+    s.write(f"Generated: {meta.get('generated_at','')}\n")
+    s.write(f"Optional checks: {meta.get('include_optional_checks', False)}\n\n")
     s.write(f"Risk score: {sm.get('risk_score')} ({sm.get('risk_level')})\n")
     s.write(f"Entries: {sm.get('entry_count')} | Findings: {sm.get('finding_count')}\n")
     s.write(f"DIRECT: {sm.get('direct_count')} | RESELLER: {sm.get('reseller_count')}\n\n")
 
-    highlights = sm.get("highlights") or []
-    if highlights:
-        s.write("Highlights:\n")
-        for h in highlights:
-            s.write(f"- {h}\n")
-        s.write("\n")
-
-    rc = sm.get("rule_counts", {})
-    if rc:
-        s.write("Findings by rule:\n")
-        for k, v in sorted(rc.items(), key=lambda x: x[1], reverse=True):
-            s.write(f"- {k}: {v}\n")
+    tr = sm.get("top_rules", [])
+    if tr:
+        s.write("Top issues:\n")
+        for r in tr:
+            s.write(f"- [{r.get('severity')}] {r.get('rule_id')}: {r.get('count')}\n")
         s.write("\n")
 
     for i, f in enumerate(report.get("findings", []), start=1):
@@ -275,9 +254,6 @@ def report_to_txt_bytes(report: Dict) -> bytes:
         s.write(f"   Why buyer cares: {f.get('why_buyer_cares')}\n")
         if ev.get("line_no") is not None:
             s.write(f"   Evidence: Line {ev.get('line_no')}: {ev.get('line','')}\n")
-        else:
-            if ev.get("line"):
-                s.write(f"   Evidence: {ev.get('line')}\n")
         rec = f.get("recommendation")
         if rec:
             s.write(f"   What to do: {rec}\n")
